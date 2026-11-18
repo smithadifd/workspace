@@ -1,0 +1,5 @@
+system: Fixture
+excluded: []
+projects:
+  - lifecycle: active
+    owner: platform

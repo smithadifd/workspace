@@ -1,0 +1,4 @@
+excluded: []
+projects:
+  - name: alpha
+    lifecycle: {a: 1}

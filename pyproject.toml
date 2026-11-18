@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "workspace"
+version = "0.1.0.dev0"
+description = "Read-only checks of a workspace registry against its map, its settings and the repos on disk, driven by one CLI."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Andrew Smith" }]
+dependencies = ["PyYAML>=6"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Operating System :: POSIX",
+]
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+[project.scripts]
+workspace = "workspace.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["workspace", "workspace.*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

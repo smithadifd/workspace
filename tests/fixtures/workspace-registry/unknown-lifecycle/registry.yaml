@@ -1,0 +1,55 @@
+system: Fixture
+harness_root: "$HARNESS_ROOT"
+code_roots:
+  laptop: ~/src
+excluded:
+  - path: ~/private/**
+    reason: fixture confidential data
+  - path: ~/scratch
+    reason: fixture scratch data
+  - path: /var/private
+    reason: fixture absolute confidential data
+clusters:
+  - id: core
+    name: Core systems
+    owner: platform
+    lifecycle: active
+    one_liner: Current platform systems.
+  - id: former
+    name: Former systems
+    owner: previous team
+    lifecycle: archived
+    one_liner: Historical systems now owned elsewhere.
+projects:
+  - name: alpha
+    remote: https://example.invalid/platform/alpha.git
+    paths: {laptop: ~/src/alpha}
+    subpath: null
+    one_liner: Primary service.
+    owner: platform
+    owned_or_reference: owned
+    tier: project
+    cluster: core
+    lifecycle: bogon
+    doc: docs/alpha.md
+    confused_with: "`alpha-client` (service, not client)"
+  - name: legacy
+    remote: https://example.invalid/former/legacy.git
+    paths: {laptop: ~/src/legacy}
+    subpath: null
+    one_liner: Retired service.
+    owner: previous team
+    owned_or_reference: reference
+    tier: project
+    cluster: [core, former]
+    lifecycle: archived
+    doc: null
+    confused_with: null
+edges:
+  - from: alpha
+    to: legacy
+    kind: protocol
+    evidence: reads the legacy export format
+    approved_at: 2026-10-17
+declined: []
+rejected_edges: []

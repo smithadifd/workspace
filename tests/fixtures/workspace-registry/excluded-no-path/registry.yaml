@@ -1,0 +1,4 @@
+system: Fixture
+excluded:
+  - reason: fixture entry with no path
+projects: []

@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "additionalDirectories": ["<code root 1>", "<code root 2>"],
+    "deny": [
+      "Read(<excluded path 1>/**)",
+      "Edit(<excluded path 1>/**)",
+      "Read(<excluded path 2>/**)",
+      "Edit(<excluded path 2>/**)"
+    ]
+  }
+}

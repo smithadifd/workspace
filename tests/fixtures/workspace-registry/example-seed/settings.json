@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "additionalDirectories": ["~/src"],
+    "deny": [
+      "Read(~/scratch-lanes/**)",
+      "Edit(~/scratch-lanes/**)",
+      "Read(~/vault/**)",
+      "Edit(~/vault/**)"
+    ]
+  }
+}

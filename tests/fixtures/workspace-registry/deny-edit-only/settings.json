@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "additionalDirectories": [
+      "~/src"
+    ],
+    "deny": [
+      "Read(~/private/**)",
+      "Edit(~/private/**)",
+      "Read(//var/private/**)",
+      "Edit(//var/private/**)",
+      "Edit(~/scratch/**)"
+    ]
+  }
+}

@@ -1,0 +1,8 @@
+system: Fixture
+? [a, b]
+: complex key that cannot be hashed
+harness_root: "$HARNESS_ROOT"
+code_roots:
+  laptop: ~/src
+excluded: []
+projects: []
