@@ -1629,6 +1629,64 @@ def test_git_dir_excluded_by_a_glob_is_refused_by_its_text(tmp_path, monkeypatch
     assert trace.beneath(tree.root / "secret") == [], trace.beneath(tree.root / "secret")
 
 
+def test_git_marker_excluded_by_a_glob_is_unknown_and_not_touched(tmp_path, monkeypatch):
+    # The glob names no entry on disk, so the marker's text is its only guard.
+    tree = Tree(tmp_path)
+    marker = tree.root / "alpha-wt" / ".git"
+    exclude(tree, tree.root / "alpha-w*" / ".git")
+    trace = Trace()
+    code, out = trace.run(monkeypatch, tree)
+    assert_unknown(code, out, "git marker %s, which is excluded; not read" % marker)
+    assert trace.under(marker) == [], trace.under(marker)
+    assert trace.opened(marker) == [], trace.opened(marker)
+
+
+GLOB_NAMES = pytest.mark.parametrize("name", ["[priv]", "pr*v", "pr?v"],
+                                     ids=["brackets", "star", "question-mark"])
+
+
+def glob_named_repo(tree, name, written):
+    """A repo whose real folder name holds a glob character, excluded as `written`."""
+    folder = tree.root / name
+    make_repo(folder, "https://example.invalid/acme/private-sentinel.git")
+    exclude(tree, tree.root / written)
+    return folder
+
+
+def assert_glob_named_skipped(folder, code, out, trace):
+    assert code == 0, out
+    assert "SKIP   %s: excluded path, not read" % folder in out.splitlines(), out
+    assert "sentinel" not in out, out
+    assert trace.beneath(folder) == [], "scan touched beneath the excluded path: %r" % trace.beneath(folder)
+    assert trace.opened(folder) == [], trace.opened(folder)
+    assert trace.git_under(folder) == [], trace.git_under(folder)
+
+
+@GLOB_NAMES
+def test_excluded_name_holding_a_glob_character_is_matched_by_its_text(tmp_path, monkeypatch, name):
+    tree = Tree(tmp_path)
+    folder = glob_named_repo(tree, name, name)
+    trace = Trace()
+    code, out = trace.run(monkeypatch, tree)
+    assert_glob_named_skipped(folder, code, out, trace)
+    # Its text refuses it before any file call: the one call that reaches it
+    # is the lstat that learns its identity, never a look by the listing.
+    calls = [call for call in trace.calls if reaches(call[1], str(folder), itself=True)]
+    assert calls == [("lstat", str(folder))], calls
+
+
+@GLOB_NAMES
+def test_excluded_name_holding_a_glob_character_in_another_case_is_matched_by_identity(
+        tmp_path, monkeypatch, name):
+    # The registry says the name in capitals; the folder on disk is lower case.
+    tree = Tree(tmp_path)
+    folder = glob_named_repo(tree, name, name.upper())
+    fold_case(monkeypatch, tree.root, name)
+    trace = Trace()
+    code, out = trace.run(monkeypatch, tree)
+    assert_glob_named_skipped(folder, code, out, trace)
+
+
 # --------------------------------------------------------------------------
 # The plain shape: a repo's .git folder has no commondir
 # --------------------------------------------------------------------------
@@ -1781,12 +1839,16 @@ def test_hardlinked_git_file_is_unknown_and_never_read(tmp_path, monkeypatch, wh
     assert spy.reads == 0, "scan read %d time(s) from the hard-linked file" % spy.reads
 
 
-def test_git_config_larger_than_the_cap_is_unknown(tmp_path):
+def test_git_config_larger_than_the_cap_is_unknown(tmp_path, monkeypatch):
+    # Refused on its size before any byte is read.
     tree = stray_tree(tmp_path)
     config = tree.root / "stray" / ".git" / "config"
     with open(config, "a", encoding="utf-8") as handle:
         handle.write("# " + "x" * CAP + "\n")
+    spy = ReadSpy(monkeypatch, config)
     assert_unknown(*run_scan(tree), "%s is larger than %d bytes; not read" % (config, CAP))
+    assert spy.opened == 1, spy.opened
+    assert spy.reads == 0, "scan read %d time(s) from the oversized config" % spy.reads
 
 
 def test_git_config_at_the_cap_is_read(tmp_path):

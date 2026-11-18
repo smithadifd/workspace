@@ -143,9 +143,10 @@ reaches it. And by identity: `scan` looks up each excluded entry that exists
 lands on the same folder or file, whatever it is called. So an exclusion
 written `~/Code/private` still covers `~/code/private` on a case-insensitive
 disk, and an exclusion reached through a symlinked parent still covers the
-folder it names. An exclusion that uses a glob character other than the
-trailing `/*` or `/**` names no single entry, so it is matched by its text
-only.
+folder it names. An excluded path is also matched by its literal text, so a
+folder whose real name holds a glob character, such as `[priv]`, is covered by
+its text and by its identity. Any other entry that a glob character other than
+the trailing `/*` or `/**` matches is matched by its text only.
 
 The code root itself is compared by its text. Write it as its real path, with
 no symlinked folder above it: `git` records a worktree's git folder by its real
@@ -162,8 +163,9 @@ These are not covered:
 - A concurrent writer that swaps an intermediate step of a path between its
   check and the next step's check. The last step is covered: the file is
   opened without following a symlink and must be the file the walk found.
-- An exclusion that uses a glob other than a trailing `/*` or `/**` is matched
-  by its text only, so another letter case is not recognised.
+- An entry matched only by a glob other than a trailing `/*` or `/**`, not by
+  the exclusion's literal text, is matched by its text only, so another letter
+  case of it is not recognised.
 - Each excluded entry that exists is looked up, including entries outside the
   code root, to learn its identity. It is never opened.
 - A rewrite of a file that keeps its inode and size is caught only by its

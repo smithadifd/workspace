@@ -32,7 +32,10 @@ filesystem layout:
 Every path is walked hop by hop from the code root, as the kernel would walk
 it: each hop is judged by its text, then lstat'd and judged by its node
 identity, so an excluded folder is recognised under any spelling that reaches
-it (another letter case on a case-insensitive disk, a symlinked parent). A
+it (another letter case on a case-insensitive disk, a symlinked parent). An
+exclusion's text matches as a literal path as well as a glob, so a real name
+that holds a glob character is covered, and the entry its literal text names is
+lstat'd for its identity whatever characters it holds. A
 parent step pops a verified hop and never rises above the code root. A symlink
 or a missing hop is refused.
 
@@ -91,7 +94,6 @@ REJECTED_EDGE_KEYS = frozenset(("from", "to", "date", "reason"))
 
 URL_REMOTE = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*://(?:[^@/]*@)?([^/]+)(/.*)?$")
 SCP_REMOTE = re.compile(r"^(?:[^@/]+@)?([^:/]+):(?!//)(.+)$")
-GLOB_MAGIC = re.compile(r"[*?[]")
 
 # The remote from config bytes on standard input: every value, each ended by a
 # NUL, so a value that holds an escaped newline still counts as one. No repo
@@ -207,10 +209,16 @@ def exclusion_pattern(text):
 
 
 def is_excluded(path, patterns):
+    """True when `path` is an excluded pattern or beneath one, by text only.
+
+    A pattern matches as its literal text (the path itself, or a folder above
+    it), so a real name that holds a glob character such as `[priv]` is
+    covered; and as a glob, against the path and every folder above it.
+    """
     return any(
-        fnmatch.fnmatchcase(candidate, pattern)
+        within(path, pattern)
+        or any(fnmatch.fnmatchcase(candidate, pattern) for candidate in ancestors(path))
         for pattern in patterns
-        for candidate in ancestors(path)
     )
 
 
@@ -253,13 +261,13 @@ def excluded_nodes(patterns):
     """The node identity of each excluded entry that exists.
 
     Each entry itself is lstat'd, never anything beneath it, so a hop that
-    reaches it under another spelling is still recognised. A glob pattern
-    names no single entry and is matched by its text only.
+    reaches it under another spelling is still recognised. The literal text of
+    every pattern is lstat'd whatever characters it holds, so a real name with
+    a glob character is recognised too; any other entry a glob matches is
+    matched by its text only.
     """
     nodes = set()
     for pattern in patterns:
-        if GLOB_MAGIC.search(pattern):
-            continue
         try:
             info = os.lstat(pattern)
         except OSError:
