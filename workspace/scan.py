@@ -8,12 +8,19 @@ deep, and reports:
 - WARN   any other registered repo missing on this host;
 - KNOWN  an archived repo present on disk (known, not drift).
 
+Without a host, the registry's only `code_roots` host is used; with several it
+is a could-not-verify. The machine's host name is never consulted.
+
 A `.git` file marks a worktree; it folds into its parent through
-`git rev-parse --git-common-dir`. Nothing inside a repo is listed, an excluded
-path is refused before any filesystem call reaches it, and a symlink is followed
-only while every hop stays inside the code root, outside every excluded path and
-outside every repo (registered, or found directly under the root). Every check is lexical first: a path is judged by
-its text before it is touched.
+`git rev-parse --git-common-dir`. Nothing inside a repo is listed. An excluded
+path, written bare or as `folder/*` or `folder/**`, covers the folder and
+everything beneath it, and is refused before any filesystem or git call reaches
+it. So is every path git would read to identify a repo: the `.git` marker, a
+worktree's git dir and `commondir` file, the common dir and its config; those
+are read as text and judged before git runs. A symlink is followed only while
+every hop stays inside the code root, outside every excluded path and outside
+every repo (registered, or found directly under the root). Every check is
+lexical first: a path is judged by its text before it is touched.
 
 Writes nothing. No network.
 
@@ -25,7 +32,6 @@ Exit codes:
 import fnmatch
 import os
 import re
-import socket
 import stat
 import subprocess
 import sys
@@ -101,8 +107,17 @@ def expand_path(text, what):
 
 
 def exclusion_pattern(text):
-    stripped = text[:-3] if text.endswith("/**") else (text.rstrip("/") or "/")
-    return expand_path(stripped, "excluded path")
+    """An excluded path as the folder it covers, with everything beneath it.
+
+    The bare folder and its glob forms `folder/*` and `folder/**` all mean the
+    folder itself and everything under it: `is_excluded` matches a path whose
+    ancestor matches the pattern.
+    """
+    for suffix in ("/**", "/*"):
+        if text.endswith(suffix):
+            text = text[:-len(suffix)]
+            break
+    return expand_path(text.rstrip("/") or "/", "excluded path")
 
 
 def is_excluded(path, patterns):
@@ -149,6 +164,21 @@ class Scope:
                 if path != repo and within(path, repo):
                     return "%s %s" % (REFUSED_IN_REPO, repo)
         return None
+
+
+def refusal_words(refusal):
+    if refusal == REFUSED_EXCLUDED:
+        return "is excluded"
+    if refusal == REFUSED_OUTSIDE:
+        return "is outside the code root"
+    return "is %s" % refusal
+
+
+def require_clear(scope, path, what):
+    """Refuse `path`, by its text alone, unless it is inside the root and not excluded."""
+    refusal = scope.refusal(path, guard_repos=False)
+    if refusal:
+        raise Unverifiable("%s, which %s; not read" % (what, refusal_words(refusal)))
 
 
 def relative_parts(root, path):
@@ -252,9 +282,32 @@ def common_dir(folder):
     return os.path.normpath(os.path.join(folder, value))
 
 
-def git_marker(folder):
+def require_no_link(scope, path, what):
+    """lstat each hop of `path` below the code root; refuse one that is a symlink.
+
+    Call it only on a path that has just passed `require_clear`: then every hop
+    is inside the root and outside every excluded path before it is lstat'd. A
+    symlinked hop is never followed, since what it names could only be judged by
+    following it.
+    """
+    current = scope.root
+    for part in relative_parts(scope.root, path):
+        current = os.path.join(current, part)
+        try:
+            info = os.lstat(current)
+        except FileNotFoundError:
+            return
+        except OSError as exc:
+            raise Unverifiable("could not inspect %s: %s" % (current, exc))
+        if stat.S_ISLNK(info.st_mode):
+            raise Unverifiable("%s, which passes through the symlink %s; not followed"
+                               % (what, current))
+
+
+def git_marker(scope, folder):
     """'repo' for a .git folder, 'worktree' for a .git file, None for neither."""
     marker = os.path.join(folder, ".git")
+    require_clear(scope, marker, "git marker %s" % marker)
     try:
         info = os.lstat(marker)
     except FileNotFoundError:
@@ -269,7 +322,9 @@ def git_marker(folder):
 
 
 def worktree_gitdir(scope, folder):
+    """The git dir a worktree's .git file names, read as text and judged."""
     marker = os.path.join(folder, ".git")
+    require_clear(scope, marker, "git marker %s" % marker)
     try:
         with open(marker, encoding="utf-8") as handle:
             first = handle.readline().strip()
@@ -278,24 +333,68 @@ def worktree_gitdir(scope, folder):
     if not first.startswith("gitdir:"):
         raise Unverifiable("%s does not name a gitdir" % marker)
     gitdir = os.path.normpath(os.path.join(folder, first[len("gitdir:"):].strip()))
-    refusal = scope.refusal(gitdir, guard_repos=False)
-    if refusal:
-        raise Unverifiable(
-            "worktree %s keeps its git dir at %s, which %s; not read"
-            % (folder, gitdir, "is excluded" if refusal == REFUSED_EXCLUDED else "is outside the code root")
-        )
+    what = "worktree %s keeps its git dir at %s" % (folder, gitdir)
+    require_clear(scope, gitdir, what)
+    require_no_link(scope, gitdir, what)
     return gitdir
+
+
+def read_common_dir(scope, label, gitdir):
+    """The common dir git would use for `gitdir`: its `commondir` file, read as text.
+
+    Git takes the common dir from `<git dir>/commondir` when that file exists,
+    and the git dir itself otherwise.
+    """
+    pointer = os.path.join(gitdir, "commondir")
+    require_clear(scope, pointer, "%s keeps its commondir file at %s" % (label, pointer))
+    try:
+        with open(pointer, encoding="utf-8") as handle:
+            text = handle.read().rstrip("\r\n")
+    except FileNotFoundError:
+        return gitdir
+    except (OSError, UnicodeDecodeError) as exc:
+        raise Unverifiable("could not read %s: %s" % (pointer, exc))
+    if not text:
+        raise Unverifiable("%s names no common dir" % pointer)
+    return os.path.normpath(os.path.join(gitdir, text))
+
+
+def git_dirs(scope, folder, kind):
+    """Judge every path git would read for `folder`, before git runs.
+
+    The .git marker, a worktree's git dir, its `commondir` file, the common dir
+    and the config files git reads there are each checked by their text
+    against the excluded list and the code root; the git dir and the common dir
+    must not pass through a symlink. Returns (git dir, common dir).
+    """
+    label = "%s %s" % (kind, folder)
+    if kind == "repo":
+        gitdir = os.path.join(folder, ".git")
+    else:
+        gitdir = worktree_gitdir(scope, folder)
+    common = read_common_dir(scope, label, gitdir)
+    what = "%s has its common dir at %s" % (label, common)
+    require_clear(scope, common, what)
+    require_no_link(scope, common, what)
+    config = os.path.join(common, "config")
+    require_clear(scope, config, "%s keeps its git config at %s" % (label, config))
+    worktree_config = os.path.join(gitdir, "config.worktree")
+    require_clear(scope, worktree_config,
+                  "%s keeps its worktree config at %s" % (label, worktree_config))
+    return gitdir, common
 
 
 def identify(scope, folder, kind):
     """Return (parent repo path, remote) for a repo or a worktree."""
+    gitdir, common = git_dirs(scope, folder, kind)
     if kind == "repo":
-        return folder, origin_remote(["--git-dir", os.path.join(folder, ".git")], folder)
-    worktree_gitdir(scope, folder)
-    common = common_dir(folder)
-    refusal = scope.refusal(common, guard_repos=False)
-    if refusal:
-        raise Unverifiable("worktree %s has its common dir at %s, which %s" % (folder, common, refusal))
+        return folder, origin_remote(["--git-dir", gitdir], folder)
+    reported = common_dir(folder)
+    if reported != common:
+        raise Unverifiable(
+            "git names %s as the common dir of worktree %s, not %s, which its git files name"
+            % (reported, folder, common)
+        )
     parent = os.path.dirname(common) if os.path.basename(common) == ".git" else common
     return parent, origin_remote(["-C", folder], folder)
 
@@ -458,7 +557,12 @@ def scan(workspace, host):
 
     code_roots, excluded, declined, projects = validate(load_registry(workspace))
     if host is None:
-        host = socket.gethostname().split(".")[0]
+        if len(code_roots) != 1:
+            raise Unverifiable(
+                "no --host given and code_roots names more than one host (%s); pass --host"
+                % ", ".join(sorted(str(name) for name in code_roots))
+            )
+        host = next(iter(code_roots))
     if host not in code_roots:
         raise Unverifiable(
             "host `%s` is not in code_roots (known: %s); pass --host"
@@ -473,6 +577,10 @@ def scan(workspace, host):
     for project in projects:
         text = project["paths"].get(host)
         if text is None:
+            if host in project["required_on"]:
+                drift += 1
+                lines.append("DRIFT  project `%s` is required on host `%s` but has no path for it"
+                             % (project["name"], host))
             continue
         path = expand_path(text, "project `%s` path" % project["name"])
         if is_excluded(path, exclusions):
@@ -521,7 +629,7 @@ def scan(workspace, host):
             continue
         if not stat.S_ISDIR(info.st_mode):
             continue
-        kind = git_marker(entry)
+        kind = git_marker(scope, entry)
         if kind is not None:
             candidates.append((entry, entry, kind))
 
@@ -535,7 +643,7 @@ def scan(workspace, host):
             continue
         if resolved is None or not stat.S_ISDIR(info.st_mode):
             continue
-        kind = git_marker(resolved)
+        kind = git_marker(scope, resolved)
         if kind is not None:
             candidates.append((entry, resolved, kind))
 
@@ -569,7 +677,7 @@ def scan(workspace, host):
         present = (
             resolved is not None
             and stat.S_ISDIR(info.st_mode)
-            and git_marker(resolved) is not None
+            and git_marker(scope, resolved) is not None
         )
         for project in registered[path]:
             if present:

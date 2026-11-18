@@ -19,6 +19,8 @@ Every fixture is built in a temp dir with synthetic names. The tree:
 import builtins
 import io
 import os
+import shlex
+import shutil
 import socket
 import stat
 import subprocess
@@ -141,6 +143,7 @@ class Trace:
 
     def __init__(self):
         self.paths = []
+        self.git_calls = []
 
     def record(self, value):
         if isinstance(value, (str, bytes, os.PathLike)):
@@ -157,6 +160,7 @@ class Trace:
         original_run = subprocess.run
 
         def traced_run(args, *rest, **kwargs):
+            self.git_calls.append([os.fsdecode(arg) for arg in args])
             for flag, value in zip(args, args[1:]):
                 if flag in ("-C", "--git-dir"):
                     self.record(value)
@@ -171,6 +175,14 @@ class Trace:
     def under(self, base):
         base = os.path.normpath(str(base))
         return [path for path in self.paths if path == base or path.startswith(base + os.sep)]
+
+    def git_under(self, base):
+        """The git calls that name `base`, or a path beneath it, as an argument."""
+        base = os.path.normpath(str(base))
+        return [
+            call for call in self.git_calls
+            if any(arg == base or arg.startswith(base + os.sep) for arg in call)
+        ]
 
 
 def drift_lines(out):
@@ -429,12 +441,26 @@ def test_unexpected_crash_is_unknown_not_drift(tmp_path, monkeypatch):
 # Inputs: the host name, the home folder, the command line
 # --------------------------------------------------------------------------
 
-def test_default_host_is_the_short_host_name(tmp_path, monkeypatch):
+def test_default_host_is_the_only_code_roots_host(tmp_path, monkeypatch):
+    # The machine's name is not a code_roots key: a scan that guessed from it
+    # would stop at "host ... is not in code_roots".
     tree = Tree(tmp_path)
-    monkeypatch.setattr(socket, "gethostname", lambda: "testhost.example.invalid")
+    monkeypatch.setattr(socket, "gethostname", lambda: "elsewhere.example.invalid")
     code, out = run_scan(tree, host=None)
     assert code == 0, out
-    assert "host `testhost`" in out, out
+    assert "host `testhost`, code root %s" % tree.root in out, out
+
+
+def test_no_host_with_several_code_roots_is_unknown(tmp_path, monkeypatch):
+    # The machine's name matches the first key: a scan that guessed from it, or
+    # took the first key, would scan and pass.
+    tree = Tree(tmp_path)
+    tree.registry["code_roots"]["otherhost"] = str(tmp_path / "other-code")
+    tree.write_registry()
+    monkeypatch.setattr(socket, "gethostname", lambda: "testhost.example.invalid")
+    assert_unknown(*run_scan(tree, host=None),
+                   "no --host given and code_roots names more than one host "
+                   "(otherhost, testhost); pass --host")
 
 
 def test_tilde_paths_expand_against_the_home_folder(tmp_path, monkeypatch):
@@ -695,3 +721,274 @@ def test_folder_that_cannot_be_inspected_is_unknown(tmp_path):
     finally:
         plain.chmod(stat.S_IRWXU)
     assert_unknown(code, out, "could not inspect %s" % (plain / ".git"))
+
+
+# --------------------------------------------------------------------------
+# required_on: a project this host must hold
+# --------------------------------------------------------------------------
+
+def test_required_project_without_a_path_for_this_host_is_drift(tmp_path):
+    tree = Tree(tmp_path)
+    tree.registry["projects"].append(
+        project(tree.root, "zeta", required_on=[HOST], paths={"otherhost": "/elsewhere/zeta"})
+    )
+    tree.write_registry()
+    code, out = run_scan(tree)
+    assert code == 1, out
+    assert drift_lines(out) == [
+        "DRIFT  project `zeta` is required on host `testhost` but has no path for it"
+    ], out
+
+
+# --------------------------------------------------------------------------
+# Nesting: a registered path inside another registered repo is never entered
+# --------------------------------------------------------------------------
+
+def test_registered_path_inside_a_registered_repo_is_unknown_and_not_entered(tmp_path, monkeypatch):
+    tree = Tree(tmp_path)
+    alpha = tree.root / "alpha"
+    lane = alpha / "lanes" / "lane-1"
+    tree.registry["projects"].append(project(tree.root, "lane-1", paths={HOST: str(lane)}))
+    tree.write_registry()
+    trace = Trace()
+    code, out = trace.run(monkeypatch, tree)
+    assert_unknown(code, out, "registered path %s: inside repo %s" % (lane, alpha))
+    touched = trace.under(alpha / "lanes")
+    assert touched == [], "scan touched inside a registered repo: %r" % touched
+
+
+# --------------------------------------------------------------------------
+# Git's own configuration: none of it can hide drift
+# --------------------------------------------------------------------------
+
+def stray_tree(tmp_path):
+    """The conforming tree plus `stray`, an unregistered repo with no remote."""
+    tree = Tree(tmp_path)
+    make_repo(tree.root / "stray")
+    return tree
+
+
+def assert_stray_is_drift(tree):
+    code, out = run_scan(tree)
+    assert code == 1, out
+    assert drift_lines(out) == [
+        "DRIFT  unregistered repo at %s (no remote)" % (tree.root / "stray")
+    ], "git config outside the repo gave stray a remote:\n" + out
+
+
+def gitconfig_naming_alpha(path):
+    path.write_text('[remote "origin"]\n\turl = %s\n' % (REMOTE % "alpha"), encoding="utf-8")
+
+
+def test_caller_git_environment_cannot_hide_drift(tmp_path, monkeypatch):
+    tree = stray_tree(tmp_path)
+    monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
+    monkeypatch.setenv("GIT_CONFIG_KEY_0", "remote.origin.url")
+    monkeypatch.setenv("GIT_CONFIG_VALUE_0", REMOTE % "alpha")
+    assert_stray_is_drift(tree)
+
+
+def test_global_git_config_cannot_hide_drift(tmp_path, monkeypatch):
+    tree = stray_tree(tmp_path)
+    home = tmp_path / "home"
+    home.mkdir()
+    gitconfig_naming_alpha(home / ".gitconfig")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(home / ".config"))
+    assert_stray_is_drift(tree)
+
+
+def git_shim(tmp_path, monkeypatch, body):
+    """Put a `git` first on PATH that runs `body` (shell) before the real git."""
+    real = shutil.which("git")
+    assert real, "git is not on PATH"
+    folder = tmp_path / "shim-bin"
+    folder.mkdir()
+    shim = folder / "git"
+    shim.write_text("#!/bin/sh\n%s\nexec %s \"$@\"\n" % (body, shlex.quote(real)),
+                    encoding="utf-8")
+    shim.chmod(stat.S_IRWXU)
+    monkeypatch.setenv("PATH", str(folder) + os.pathsep + os.environ.get("PATH", ""))
+
+
+def test_system_git_config_cannot_hide_drift(tmp_path, monkeypatch):
+    # The shim stands in for a machine whose system git config sets a remote.
+    tree = stray_tree(tmp_path)
+    system = tmp_path / "system-gitconfig"
+    gitconfig_naming_alpha(system)
+    git_shim(tmp_path, monkeypatch,
+             "GIT_CONFIG_SYSTEM=%s; export GIT_CONFIG_SYSTEM" % shlex.quote(str(system)))
+    assert_stray_is_drift(tree)
+
+
+# --------------------------------------------------------------------------
+# Exclusions: every path scan or git would read is judged before it is touched
+# --------------------------------------------------------------------------
+
+@pytest.mark.parametrize("suffix", ["/*", "/**", "/", ""], ids=["star", "star-star", "slash", "bare"])
+def test_excluded_glob_forms_cover_the_folder_and_everything_beneath(tmp_path, monkeypatch, suffix):
+    tree = Tree(tmp_path)
+    secret = tree.root / "secret"
+    tree.registry["excluded"] = [{"path": str(secret) + suffix, "reason": "fixture private data"}]
+    tree.write_registry()
+    trace = Trace()
+    code, out = trace.run(monkeypatch, tree)
+    assert code == 0, out
+    assert "SKIP   %s: excluded path, not read" % secret in out, out
+    assert "SKIP   %s: symlink excluded path, not read" % (tree.root / "sneaky") in out, out
+    touched = trace.under(secret)
+    assert touched == [], "scan touched the excluded path: %r" % touched
+    assert "secret" not in "\n".join(drift_lines(out)), out
+
+
+def odd_repo(tree, remote=None):
+    odd = tree.root / "odd"
+    make_repo(odd, remote)
+    return odd
+
+
+def exclude(tree, path):
+    tree.registry["excluded"].append({"path": str(path), "reason": "fixture"})
+    tree.write_registry()
+
+
+def test_excluded_git_marker_is_unknown_and_not_touched(tmp_path, monkeypatch):
+    tree = Tree(tmp_path)
+    odd = odd_repo(tree)
+    marker = odd / ".git"
+    exclude(tree, marker)
+    trace = Trace()
+    code, out = trace.run(monkeypatch, tree)
+    assert_unknown(code, out, "git marker %s, which is excluded; not read" % marker)
+    assert trace.under(marker) == [], trace.under(marker)
+    assert trace.git_under(odd) == [], trace.git_under(odd)
+
+
+def test_excluded_git_config_is_unknown_and_git_never_runs_on_it(tmp_path, monkeypatch):
+    tree = Tree(tmp_path)
+    odd = odd_repo(tree, "https://example.invalid/acme/sentinel.git")
+    config = odd / ".git" / "config"
+    exclude(tree, config)
+    trace = Trace()
+    code, out = trace.run(monkeypatch, tree)
+    assert_unknown(code, out, "repo %s keeps its git config at %s, which is excluded; not read"
+                   % (odd, config))
+    assert "sentinel" not in out, out
+    assert trace.under(config) == [], trace.under(config)
+    assert trace.git_under(odd) == [], trace.git_under(odd)
+
+
+def alpha_wt_gitdir(tree):
+    return tree.root / "alpha" / ".git" / "worktrees" / "alpha-wt"
+
+
+def test_excluded_commondir_file_is_unknown_and_not_read(tmp_path, monkeypatch):
+    tree = Tree(tmp_path)
+    worktree = tree.root / "alpha-wt"
+    pointer = alpha_wt_gitdir(tree) / "commondir"
+    exclude(tree, pointer)
+    trace = Trace()
+    code, out = trace.run(monkeypatch, tree)
+    assert_unknown(code, out, "worktree %s keeps its commondir file at %s, which is excluded; not read"
+                   % (worktree, pointer))
+    assert trace.under(pointer) == [], trace.under(pointer)
+    assert trace.git_under(worktree) == [], trace.git_under(worktree)
+
+
+def test_excluded_worktree_config_is_unknown_and_git_never_runs(tmp_path, monkeypatch):
+    tree = Tree(tmp_path)
+    worktree = tree.root / "alpha-wt"
+    config = alpha_wt_gitdir(tree) / "config.worktree"
+    exclude(tree, config)
+    trace = Trace()
+    code, out = trace.run(monkeypatch, tree)
+    assert_unknown(code, out, "worktree %s keeps its worktree config at %s, which is excluded; not read"
+                   % (worktree, config))
+    assert trace.git_under(worktree) == [], trace.git_under(worktree)
+
+
+def synthetic_worktree(tree, common):
+    """A worktree `odd` whose git dir sits in the code root and names `common`."""
+    gitdir = tree.root / "plain" / "odd-meta"
+    gitdir.mkdir()
+    (gitdir / "HEAD").write_text("ref: refs/heads/main\n", encoding="utf-8")
+    (gitdir / "commondir").write_text("%s\n" % common, encoding="utf-8")
+    odd = tree.root / "odd"
+    odd.mkdir()
+    (odd / ".git").write_text("gitdir: %s\n" % gitdir, encoding="utf-8")
+    return odd
+
+
+@pytest.mark.parametrize("where", ["outside", "excluded"])
+def test_worktree_common_dir_is_judged_before_git_runs(tmp_path, monkeypatch, where):
+    tree = Tree(tmp_path)
+    if where == "outside":
+        base, common, words = tree.outside, tree.outside / "delta-clone" / ".git", "is outside the code root"
+    else:
+        base, common, words = tree.root / "secret", tree.root / "secret" / ".git", "is excluded"
+    odd = synthetic_worktree(tree, common)
+    trace = Trace()
+    code, out = trace.run(monkeypatch, tree)
+    assert_unknown(code, out, "worktree %s has its common dir at %s, which %s; not read"
+                   % (odd, common, words))
+    assert trace.under(base) == [], trace.under(base)
+    assert trace.git_under(odd) == [], "git ran on the worktree: %r" % trace.git_under(odd)
+
+
+def test_git_dir_through_a_symlink_is_unknown_and_not_followed(tmp_path, monkeypatch):
+    # By its text the git dir is in the code root; the link takes it into the
+    # excluded folder.
+    tree = Tree(tmp_path)
+    link = tree.root / "plain" / "odd-meta"
+    link.symlink_to(Path("..") / "secret" / ".git")
+    odd = tree.root / "odd"
+    odd.mkdir()
+    (odd / ".git").write_text("gitdir: %s\n" % link, encoding="utf-8")
+    trace = Trace()
+    code, out = trace.run(monkeypatch, tree)
+    assert_unknown(code, out, "worktree %s keeps its git dir at %s, which passes through the "
+                   "symlink %s; not followed" % (odd, link, link))
+    assert trace.under(link / "commondir") == [], trace.paths
+    assert trace.git_under(odd) == [], "git ran on the worktree: %r" % trace.git_under(odd)
+
+
+def test_unreadable_commondir_file_is_unknown(tmp_path):
+    tree = Tree(tmp_path)
+    pointer = alpha_wt_gitdir(tree) / "commondir"
+    pointer.chmod(0)
+    try:
+        code, out = run_scan(tree)
+    finally:
+        pointer.chmod(stat.S_IRUSR | stat.S_IWUSR)
+    assert_unknown(code, out, "could not read %s" % pointer)
+
+
+def test_git_dir_hop_that_cannot_be_inspected_is_unknown(tmp_path):
+    tree = Tree(tmp_path)
+    worktrees = tree.root / "alpha" / ".git" / "worktrees"
+    worktrees.chmod(0)
+    try:
+        code, out = run_scan(tree)
+    finally:
+        worktrees.chmod(stat.S_IRWXU)
+    assert_unknown(code, out, "could not inspect %s" % (worktrees / "alpha-wt"))
+
+
+def test_empty_commondir_file_is_unknown(tmp_path):
+    tree = Tree(tmp_path)
+    pointer = alpha_wt_gitdir(tree) / "commondir"
+    pointer.write_text("\n", encoding="utf-8")
+    assert_unknown(*run_scan(tree), "%s names no common dir" % pointer)
+
+
+def test_git_disagreeing_with_the_judged_common_dir_is_unknown(tmp_path, monkeypatch):
+    # The shim stands in for a git whose answer differs from what the worktree's
+    # files say; scan must not trust a common dir it did not judge.
+    tree = Tree(tmp_path)
+    worktree = tree.root / "alpha-wt"
+    elsewhere = tree.root / "gamma" / ".git"
+    git_shim(tmp_path, monkeypatch,
+             'case "$*" in *rev-parse*--git-common-dir*) echo %s; exit 0;; esac'
+             % shlex.quote(str(elsewhere)))
+    assert_unknown(*run_scan(tree), "git names %s as the common dir of worktree %s, not %s"
+                   % (elsewhere, worktree, tree.root / "alpha" / ".git"))

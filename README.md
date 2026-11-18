@@ -77,31 +77,44 @@ Later verbs (`gen` to render the map and settings from the registry,
 
 - The workspace folder's `registry.yaml`, its map (`AGENTS.md`, or `CLAUDE.md`)
   and `.claude/settings.json`. `scan` reads only `registry.yaml`.
+- Which host it is on: the `code_roots` key that `--host` names. Without
+  `--host`, `scan` uses the registry's only host when `code_roots` names exactly
+  one; when it names several, `scan` exits 2 and names them. It never guesses
+  from the machine's host name.
 - The code root that the registry names for this host, one level deep: the
   names in that folder, and for each entry whether it holds a `.git` folder or a
   `.git` file. For each repository it finds, `git` reads the remote URL from the
   repository's config, and for a worktree `git rev-parse --git-common-dir` finds
-  its parent. `git` runs with the system and global git config switched off.
+  its parent. `git` runs with the system and global git config switched off and
+  with every `GIT_` variable from your environment removed.
+- Before `git` runs on a repository, `scan` reads a worktree's `.git` file and
+  its `commondir` file as text, and checks every path `git` would read (the
+  `.git` marker, the git folder, the common folder and its config) against the
+  excluded list and the code root. A path that fails, or a git or common folder
+  reached through a symlink, ends the scan with exit 2, and `git` is not run.
 - Symlinks in the code root are followed hop by hop, and only while every hop
   stays inside the code root, outside every excluded path and outside every
   repository (registered, or found directly under the code root).
 
 **What it never reads.**
 
-- Any path the registry lists under `excluded`, nor anything under one. A path
-  is checked against the excluded list by its text before any file call reaches
-  it. That is where you list agent scratch folders, worktree copies, and folders
+- Any path the registry lists under `excluded`, nor anything under one. An
+  exclusion written as a bare folder, as `folder/*` or as `folder/**` covers that
+  folder and everything beneath it. A path is checked against the excluded list
+  by its text before any file call or `git` command reaches it. That is where you list agent scratch folders, worktree copies, and folders
   that hold live personal data, such as a rooms folder.
 - Anything outside the code root, through a symlink or otherwise.
 - The contents of a repository. Nothing inside a repository is listed or opened
   apart from its `.git` marker and, through `git`, its config, so `.env` files
   and other secrets in a repository are never read.
 
-Paths are compared as written, after `~` expands to your home folder. Write the
-code root and the excluded paths in the same form (both through `~`, or both
-absolute through the same folder names), because a path that reaches the same
-folder by another name, through a symlinked parent, is not recognised as the
-same path.
+Paths are compared as written, after `~` expands to your home folder, and
+letter case counts. Write the code root and the excluded paths in the same form
+(both through `~`, or both absolute through the same folder names), because a
+path that reaches the same folder by another name is not recognised as the same
+path: through a symlinked parent, or in different letter case on a
+case-insensitive disk, where an exclusion written `~/Code/private` does not
+match `~/code/private`.
 
 **What it writes.** Nothing. `check` and `scan` only read, and neither opens a
 network connection.
@@ -146,14 +159,15 @@ GAP   excluded path `~/scratch` is not in permissions.deny
 == result: 2 gap ==
 ```
 
-`scan` picks this host's code root from the registry's `code_roots`. The host
-name is the machine's short host name unless `--host` names another key of
-`code_roots`. It prints one line per finding:
+`scan` picks this host's code root from the registry's `code_roots`, as
+[What it does on your machine](#what-it-does-on-your-machine) describes. It
+prints one line per finding:
 
 | Line | Meaning |
 |------|---------|
 | `DRIFT  unregistered repo at PATH (REMOTE)` | A repository the registry neither names nor declines. |
 | `DRIFT  project NAME is missing on host HOST, which its required_on names: PATH` | A registered repository that `required_on` says must be on this host, and is not. |
+| `DRIFT  project NAME is required on host HOST but has no path for it` | A project whose `required_on` names this host, but which records no path for this host. |
 | `WARN   project NAME is missing on host HOST: PATH` | A registered repository not on this host. |
 | `KNOWN  archived project NAME is present at PATH` | An archived repository still on disk: known, not drift. |
 | `INFO   declined repo at PATH (REMOTE)` | A repository you declined. |
@@ -177,9 +191,11 @@ with `/` or `~` is a path glob matched against the repository's folder.
 
 Exit 2 always prints `UNKNOWN` and the reason, and it is never a pass. `scan`
 exits 2 on a registry it cannot read or parse, a field outside the registry's
-grammar, a host missing from `code_roots`, a code root it cannot list, a
-registered path outside the code root or under an excluded path, and any `git`
-error. An unknown field is refused rather than skipped, so a typo cannot quietly
+grammar, a host missing from `code_roots`, no `--host` when `code_roots` names
+several hosts, a code root it cannot list, a registered path outside the code
+root, under an excluded path or inside another repository, a path `git` would
+read that is excluded, outside the code root or reached through a symlink, and
+any `git` error. An unknown field is refused rather than skipped, so a typo cannot quietly
 turn a rule off.
 
 ## How it is built
