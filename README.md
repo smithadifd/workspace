@@ -95,13 +95,15 @@ Later verbs (`gen` to render the map and settings from the registry,
   when it is the same regular file the walk found, so a FIFO or a file swapped
   in after the walk is refused rather than read. Any of these ends the scan with
   exit 2.
-- `git` never runs on a repository and is never given a repository path. Its
-  one job is to read `remote.origin.url` from the bytes of a `config` or
-  `config.worktree` file passed on its standard input, with `[include]` and
-  `[includeIf]` sections ignored (the files they name are never opened), with
-  the system and global git config switched off, with every `GIT_` variable from
-  your environment removed, and from the filesystem root, so the folder you run
-  `scan` from plays no part.
+- `git` never runs on a repository and is never given a repository path. It
+  only reads the bytes of a `config` or `config.worktree` file passed on its
+  standard input, with includes switched off, with the system and global git
+  config switched off, with every `GIT_` variable from your environment
+  removed, and from the filesystem root, so the folder you run `scan` from
+  plays no part. First `git`'s own parser lists any `[include]` or
+  `[includeIf]` key in those bytes: a config with one ends the scan with exit
+  2, and the file it names is never opened. Then `git` reads
+  `remote.origin.url`.
 - Symlinks in the code root are followed hop by hop, and only while every hop
   stays inside the code root, outside every excluded path and outside every
   repository (registered, or found directly under the code root).
@@ -213,7 +215,8 @@ grammar, a host missing from `code_roots`, no `--host` when `code_roots` names
 several hosts, a code root it cannot list, a registered path outside the code
 root, under an excluded path or inside another repository, a git file whose
 path is excluded, leaves the code root, passes through a symlink or a missing
-step, or that is not a regular file, and any `git` error. An unknown field is
+step, or that is not a regular file, a git config with an include section, and
+any `git` error. An unknown field is
 refused rather than skipped, so a typo cannot quietly turn a rule off.
 
 ## How it is built

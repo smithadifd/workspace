@@ -27,10 +27,12 @@ files is refused.
 
 scan reads a repo's git files itself: the `.git` file, `commondir`, `config`
 and `config.worktree`, each opened without following a symlink and read only
-when it is the regular file the walk verified. git never runs on a repo: its
-one call reads `remote.origin.url` from config bytes on its standard input,
-with includes, the system and global config switched off, from the filesystem
-root.
+when it is the regular file the walk verified. git never runs on a repo: it
+only reads config bytes on its standard input, with includes, the system and
+global config switched off, from the filesystem root. It first lists any
+include key in those bytes (a config with an include section is a
+could-not-verify; the file it names is never followed), then reads
+`remote.origin.url`.
 
 Writes nothing. No network.
 
@@ -80,6 +82,10 @@ GLOB_MAGIC = re.compile(r"[*?[]")
 # The one git call: the remote from config bytes on standard input. No repo
 # path is ever an argument, and includes are never followed.
 GIT_REMOTE_ARGS = ("config", "--file", "-", "--no-includes", "--get", "remote.origin.url")
+# Before that, git's own parser lists any include key in the same bytes; an
+# include section is refused, never followed.
+GIT_INCLUDE_ARGS = ("config", "--file", "-", "--no-includes", "--name-only",
+                    "--get-regexp", r"^(include|includeif)\.")
 
 # A git file is opened without following a symlink and without blocking on a
 # FIFO; it is read only after fstat shows the regular file the walk lstat'd.
@@ -434,11 +440,11 @@ def git_env():
     return env
 
 
-def origin_remote(data, folder, path):
-    """remote.origin.url from config bytes, or None; git sees only the bytes."""
+def run_git(args, data, folder, path):
+    """git on config bytes on stdin, from the filesystem root; never a repo path."""
     try:
-        result = subprocess.run(
-            ["git", *GIT_REMOTE_ARGS],
+        return subprocess.run(
+            ["git", *args],
             input=data,
             capture_output=True,
             env=git_env(),
@@ -452,6 +458,27 @@ def origin_remote(data, folder, path):
         raise Unverifiable("git timed out on %s (%s)" % (folder, path))
     except OSError as exc:
         raise Unverifiable("git could not run on %s (%s): %s" % (folder, path, exc))
+
+
+def git_failure(result, folder, path):
+    return Unverifiable("git error on %s (%s): %s"
+                        % (folder, path, result.stderr.decode("utf-8", "replace").strip()))
+
+
+def refuse_includes(data, folder, path):
+    """Refuse config bytes that hold an include section, as git's parser reads them."""
+    result = run_git(GIT_INCLUDE_ARGS, data, folder, path)
+    if result.returncode == 1 and not result.stdout.strip():
+        return
+    if result.returncode in (0, 1):
+        raise Unverifiable("%s: git config includes are not followed (%s has one); not read"
+                           % (folder, path))
+    raise git_failure(result, folder, path)
+
+
+def origin_remote(data, folder, path):
+    """remote.origin.url from config bytes, or None; git sees only the bytes."""
+    result = run_git(GIT_REMOTE_ARGS, data, folder, path)
     if result.returncode == 0:
         return result.stdout.decode("utf-8", "replace").strip() or None
     if result.returncode == 1:
@@ -531,6 +558,8 @@ def identify(scope, hops, kind, marker_info):
             configs.append((path, found[-1][1]))
     contents = [(path, read_file(path, info)) for path, info in configs]
 
+    for path, data in contents:
+        refuse_includes(data, folder, path)
     # config.worktree is read after config, so its value wins, as in git.
     remote = None
     for path, data in contents:

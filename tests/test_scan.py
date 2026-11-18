@@ -964,19 +964,19 @@ def with_include(config, header, included, bom=False):
     ],
     ids=["include", "includeIf", "adjacent-header", "bom"],
 )
-def test_git_config_include_is_never_followed(tmp_path, monkeypatch, header, bom):
+def test_git_config_include_is_unknown_and_never_followed(tmp_path, monkeypatch, header, bom):
     # The included file, under the excluded folder, would give the
     # unregistered repo alpha's remote and hide it.
     tree = stray_tree(tmp_path)
+    stray = tree.root / "stray"
+    config = stray / ".git" / "config"
     included = tree.root / "secret" / "included.gitconfig"
     gitconfig_naming_alpha(included)
-    with_include(tree.root / "stray" / ".git" / "config", header, included, bom=bom)
+    with_include(config, header, included, bom=bom)
     trace = Trace()
     code, out = trace.run(monkeypatch, tree)
-    assert code == 1, out
-    assert drift_lines(out) == [
-        "DRIFT  unregistered repo at %s (no remote)" % (tree.root / "stray")
-    ], "git followed the include:\n" + out
+    assert_unknown(code, out, "%s: git config includes are not followed (%s has one); not read"
+                   % (stray, config))
     assert trace.beneath(tree.root / "secret") == [], trace.beneath(tree.root / "secret")
     assert trace.git_under(tree.root) == [], "git was handed a path: %r" % trace.git_under(tree.root)
 
@@ -1265,6 +1265,8 @@ def test_git_config_with_a_non_utf8_comment_is_read(tmp_path):
 # --------------------------------------------------------------------------
 
 GIT_REMOTE_CALL = ["git", "config", "--file", "-", "--no-includes", "--get", "remote.origin.url"]
+GIT_INCLUDE_CALL = ["git", "config", "--file", "-", "--no-includes", "--name-only",
+                    "--get-regexp", r"^(include|includeif)\."]
 GIT_SET_VARIABLES = ["GIT_CONFIG_GLOBAL", "GIT_CONFIG_NOSYSTEM", "GIT_OPTIONAL_LOCKS",
                      "GIT_TERMINAL_PROMPT"]
 
@@ -1276,8 +1278,11 @@ def test_git_reads_config_bytes_only_with_includes_and_outside_config_off(tmp_pa
     code, out = trace.run(monkeypatch, tree)
     assert code == 0, out
     assert trace.git_runs, "git never ran"
+    # Each config's bytes are listed for include keys, then read for the remote.
+    calls = [run["args"] for run in trace.git_runs]
+    assert all(call in (GIT_INCLUDE_CALL, GIT_REMOTE_CALL) for call in calls), calls
+    assert calls.count(GIT_INCLUDE_CALL) == calls.count(GIT_REMOTE_CALL) > 0, calls
     for run in trace.git_runs:
-        assert run["args"] == GIT_REMOTE_CALL, run["args"]
         assert run["cwd"] == os.sep, run["cwd"]
         assert isinstance(run["input"], bytes), run["input"]
         env = run["env"]
