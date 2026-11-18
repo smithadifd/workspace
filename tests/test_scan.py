@@ -17,6 +17,7 @@ Every fixture is built in a temp dir with synthetic names. The tree:
     ws/registry.yaml          alpha, legacy, delta (missing) [, epsilon (missing, required_on)]
 """
 import builtins
+import errno
 import io
 import os
 import shlex
@@ -998,16 +999,17 @@ def test_excluded_commondir_file_is_unknown_and_not_read(tmp_path, monkeypatch):
     assert trace.git_under(worktree) == [], trace.git_under(worktree)
 
 
-def test_excluded_worktree_config_is_unknown_and_git_never_runs(tmp_path, monkeypatch):
+def test_worktree_config_file_is_never_touched(tmp_path, monkeypatch):
+    # scan never reads config.worktree: no file call reaches it.
     tree = Tree(tmp_path)
     worktree = tree.root / "alpha-wt"
     config = alpha_wt_gitdir(tree) / "config.worktree"
-    exclude(tree, config)
+    gitconfig_naming_alpha(config)
     trace = Trace()
     code, out = trace.run(monkeypatch, tree)
-    assert_unknown(code, out, "worktree %s keeps its worktree config at %s, which is excluded; not read"
-                   % (worktree, config))
-    assert trace.git_under(worktree) == [], trace.git_under(worktree)
+    assert code == 0, out
+    assert "INFO   worktree %s folds into %s" % (worktree, tree.root / "alpha") in out, out
+    assert trace.under(config) == [], trace.under(config)
 
 
 def synthetic_worktree(tree, common):
@@ -1247,6 +1249,30 @@ def test_git_file_swapped_after_its_walk_is_unknown_and_not_read(tmp_path, monke
     assert_unknown(*run_scan(tree), "%s changed while it was read; not read" % config)
 
 
+def test_git_config_swapped_for_a_symlink_after_its_walk_is_refused(tmp_path, monkeypatch):
+    # A writer replaces stray's config with a symlink into the excluded folder
+    # between the walk's lstat and the open; the open refuses to follow it.
+    tree = stray_tree(tmp_path)
+    config = tree.root / "stray" / ".git" / "config"
+    target = tree.root / "secret" / "real-cfg"
+    gitconfig_naming_alpha(target)
+    real_open = os.open
+    swapped = []
+
+    def racing_open(path, *args, **kwargs):
+        if os.fsdecode(path) == str(config) and not swapped:
+            swapped.append(path)
+            os.unlink(config)
+            os.symlink(Path("..") / ".." / "secret" / "real-cfg", config)
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", racing_open)
+    code, out = run_scan(tree)
+    assert swapped, "the config was never opened"
+    assert_unknown(code, out, "could not read %s: [Errno %d] %s"
+                   % (config, errno.ELOOP, os.strerror(errno.ELOOP)))
+
+
 def test_git_config_with_a_non_utf8_comment_is_read(tmp_path):
     tree = Tree(tmp_path)
     latin = tree.root / "latin"
@@ -1267,6 +1293,8 @@ def test_git_config_with_a_non_utf8_comment_is_read(tmp_path):
 GIT_REMOTE_CALL = ["git", "config", "--file", "-", "--no-includes", "--get", "remote.origin.url"]
 GIT_INCLUDE_CALL = ["git", "config", "--file", "-", "--no-includes", "--name-only",
                     "--get-regexp", r"^(include|includeif)\."]
+GIT_WORKTREE_CONFIG_CALL = ["git", "config", "--file", "-", "--no-includes", "--type=bool",
+                            "--get", "extensions.worktreeConfig"]
 GIT_SET_VARIABLES = ["GIT_CONFIG_GLOBAL", "GIT_CONFIG_NOSYSTEM", "GIT_OPTIONAL_LOCKS",
                      "GIT_TERMINAL_PROMPT"]
 
@@ -1278,10 +1306,13 @@ def test_git_reads_config_bytes_only_with_includes_and_outside_config_off(tmp_pa
     code, out = trace.run(monkeypatch, tree)
     assert code == 0, out
     assert trace.git_runs, "git never ran"
-    # Each config's bytes are listed for include keys, then read for the remote.
+    # Each config's bytes are listed for include keys, read for per-worktree
+    # config, then read for the remote.
     calls = [run["args"] for run in trace.git_runs]
-    assert all(call in (GIT_INCLUDE_CALL, GIT_REMOTE_CALL) for call in calls), calls
-    assert calls.count(GIT_INCLUDE_CALL) == calls.count(GIT_REMOTE_CALL) > 0, calls
+    assert all(call in (GIT_INCLUDE_CALL, GIT_WORKTREE_CONFIG_CALL, GIT_REMOTE_CALL)
+               for call in calls), calls
+    assert (calls.count(GIT_INCLUDE_CALL) == calls.count(GIT_WORKTREE_CONFIG_CALL)
+            == calls.count(GIT_REMOTE_CALL) > 0), calls
     for run in trace.git_runs:
         assert run["cwd"] == os.sep, run["cwd"]
         assert isinstance(run["input"], bytes), run["input"]
@@ -1419,3 +1450,90 @@ def test_relative_paths_worktree_folds_into_its_parent(tmp_path):
         "DRIFT  unregistered repo at %s (example.invalid/acme/beta)" % (root / "beta")
     ], "the worktree was not folded into its parent:\n" + out
     assert "INFO   worktree %s folds into %s" % (root / "beta-rel", root / "beta") in out, out
+
+
+# --------------------------------------------------------------------------
+# Per-worktree config: not judged, so a could-not-verify
+# --------------------------------------------------------------------------
+
+@pytest.mark.parametrize(
+    "setting",
+    ["\tworktreeConfig = true\n", "\tworktreeConfig = yes\n", "\tworktreeconfig\n"],
+    ids=["true", "yes", "bare-key"],
+)
+def test_repo_with_per_worktree_config_is_unknown(tmp_path, setting):
+    tree = stray_tree(tmp_path)
+    stray = tree.root / "stray"
+    config = stray / ".git" / "config"
+    with open(config, "a", encoding="utf-8") as handle:
+        handle.write("[extensions]\n" + setting)
+    assert_unknown(*run_scan(tree), "%s: per-worktree config is not supported (%s sets "
+                   "extensions.worktreeConfig true); could not verify" % (stray, config))
+
+
+def test_left_over_worktree_config_is_never_read(tmp_path):
+    # stray has no remote and does not turn on per-worktree config, so git
+    # ignores its config.worktree, which names a registered remote.
+    tree = stray_tree(tmp_path)
+    gitconfig_naming_alpha(tree.root / "stray" / ".git" / "config.worktree")
+    assert_stray_is_drift(tree)
+
+
+# --------------------------------------------------------------------------
+# A worktree's git dir must be <common>/worktrees/<name>, with commondir and HEAD
+# --------------------------------------------------------------------------
+
+def lookalike_meta(tree):
+    """A git dir outside any worktrees/ folder, with HEAD and a commondir naming alpha."""
+    meta = tree.root / "plain" / "odd-meta"
+    meta.mkdir()
+    (meta / "HEAD").write_text("ref: refs/heads/main\n", encoding="utf-8")
+    (meta / "commondir").write_text("%s\n" % (tree.root / "alpha" / ".git"), encoding="utf-8")
+    return meta
+
+
+def sibling_meta(tree):
+    """A git dir with HEAD and commondir under alpha's .git, but not in worktrees/."""
+    meta = tree.root / "alpha" / ".git" / "other" / "odd"
+    meta.mkdir(parents=True)
+    (meta / "HEAD").write_text("ref: refs/heads/main\n", encoding="utf-8")
+    (meta / "commondir").write_text("../..\n", encoding="utf-8")
+    return meta
+
+
+def no_head(tree):
+    (alpha_wt_gitdir(tree) / "HEAD").unlink()
+
+
+def head_folder(tree):
+    head = alpha_wt_gitdir(tree) / "HEAD"
+    head.unlink()
+    head.mkdir()
+
+
+@pytest.mark.parametrize(
+    "case",
+    ["checkout", "git-dir", "lookalike", "sibling-folder", "no-head", "head-folder"],
+)
+def test_git_dir_that_is_not_a_worktree_folder_is_unknown_and_does_not_fold(tmp_path, case):
+    tree = Tree(tmp_path)
+    root = tree.root
+    if case in ("no-head", "head-folder"):
+        worktree = root / "alpha-wt"
+        text = str(alpha_wt_gitdir(tree))
+        (no_head if case == "no-head" else head_folder)(tree)
+    else:
+        if case == "checkout":
+            text = str(root / "alpha")
+        elif case == "git-dir":
+            text = str(root / "alpha" / ".git")
+        elif case == "sibling-folder":
+            text = str(sibling_meta(tree))
+        else:
+            text = str(lookalike_meta(tree))
+        worktree = worktree_file(tree, text)
+    code, out = run_scan(tree)
+    assert_unknown(code, out, "worktree %s keeps its git dir at %s, which is not a worktree git "
+                   "folder: <common>/worktrees/<name> with commondir and HEAD files; not read"
+                   % (worktree, text))
+    assert "folds into" not in out, out

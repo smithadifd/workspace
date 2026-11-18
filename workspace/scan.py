@@ -25,14 +25,17 @@ outside every excluded path and outside every repo (registered, or found
 directly under the root); a symlink or a missing hop on the way to a repo's git
 files is refused.
 
-scan reads a repo's git files itself: the `.git` file, `commondir`, `config`
-and `config.worktree`, each opened without following a symlink and read only
-when it is the regular file the walk verified. git never runs on a repo: it
-only reads config bytes on its standard input, with includes, the system and
-global config switched off, from the filesystem root. It first lists any
-include key in those bytes (a config with an include section is a
-could-not-verify; the file it names is never followed), then reads
-`remote.origin.url`.
+scan reads a repo's git files itself: the `.git` file, `commondir` and the
+common `config`, each opened without following a symlink and read only when it
+is the regular file the walk verified. A worktree's git dir must be
+`<common>/worktrees/<name>` holding a `commondir` and a `HEAD` file; any other
+git dir is a could-not-verify. git never runs on a repo: it only reads config
+bytes on its standard input, with includes, the system and global config
+switched off, from the filesystem root. It first lists any include key in those
+bytes (a config with an include section is a could-not-verify; the file it
+names is never followed), then reads `extensions.worktreeConfig` (a repo that
+uses per-worktree config is a could-not-verify; `config.worktree` is never
+read), then reads `remote.origin.url`.
 
 Writes nothing. No network.
 
@@ -86,6 +89,9 @@ GIT_REMOTE_ARGS = ("config", "--file", "-", "--no-includes", "--get", "remote.or
 # include section is refused, never followed.
 GIT_INCLUDE_ARGS = ("config", "--file", "-", "--no-includes", "--name-only",
                     "--get-regexp", r"^(include|includeif)\.")
+# Then whether the repo uses per-worktree config: scan does not judge it.
+GIT_WORKTREE_CONFIG_ARGS = ("config", "--file", "-", "--no-includes", "--type=bool",
+                            "--get", "extensions.worktreeConfig")
 
 # A git file is opened without following a symlink and without blocking on a
 # FIFO; it is read only after fstat shows the regular file the walk lstat'd.
@@ -98,6 +104,10 @@ REFUSED_EXCLUDED = "excluded path, not read"
 REFUSED_OUTSIDE = "resolves outside the code root"
 REFUSED_IN_REPO = "inside repo"
 REFUSED_LOOP = "symlink loop"
+NOT_WORKTREE = ("is not a worktree git folder: <common>/worktrees/<name> with commondir "
+                "and HEAD files; not read")
+WORKTREE_CONFIG = ("%s: per-worktree config is not supported (%s sets "
+                   "extensions.worktreeConfig true); could not verify")
 
 # Why a walk stopped at a hop that is not judged by the scope.
 HOP_LINK = "link"
@@ -476,6 +486,20 @@ def refuse_includes(data, folder, path):
     raise git_failure(result, folder, path)
 
 
+def refuse_worktree_config(data, folder, path):
+    """Refuse config bytes that turn on per-worktree config, as git's parser reads them."""
+    result = run_git(GIT_WORKTREE_CONFIG_ARGS, data, folder, path)
+    if result.returncode == 1 and not result.stdout.strip():
+        return
+    if result.returncode == 0:
+        value = result.stdout.strip()
+        if value == b"false":
+            return
+        if value == b"true":
+            raise Unverifiable(WORKTREE_CONFIG % (folder, path))
+    raise git_failure(result, folder, path)
+
+
 def origin_remote(data, folder, path):
     """remote.origin.url from config bytes, or None; git sees only the bytes."""
     result = run_git(GIT_REMOTE_ARGS, data, folder, path)
@@ -513,6 +537,27 @@ def gitdir_text(marker, data):
     return first[len("gitdir:"):].strip()
 
 
+def require_worktree_gitdir(scope, label, what, gitdir_hops, pointer_hops, common_hops):
+    """A worktree's git dir is `<common>/worktrees/<name>`, with commondir and HEAD files.
+
+    The commondir file was walked to and is read by the caller; HEAD is walked
+    to and lstat'd. A git dir anywhere else, such as another repo's checkout
+    folder or its .git folder, is refused.
+    """
+    refused = Unverifiable("%s, which %s" % (what, NOT_WORKTREE))
+    if pointer_hops is None:
+        raise refused
+    if (len(gitdir_hops) != len(common_hops) + 2
+            or hop_path(scope, gitdir_hops[:-2]) != hop_path(scope, common_hops)
+            or os.path.basename(gitdir_hops[-2][0]) != "worktrees"):
+        raise refused
+    head = os.path.join(hop_path(scope, gitdir_hops), "HEAD")
+    head_hops = walk_git(scope, gitdir_hops, "HEAD",
+                         "%s keeps its HEAD file at %s" % (label, head), missing_ok=True)
+    if head_hops is None or not stat.S_ISREG(head_hops[-1][1].st_mode):
+        raise refused
+
+
 def identify(scope, hops, kind, marker_info):
     """Return (parent repo path, remote) for the repo or worktree `hops` names.
 
@@ -526,9 +571,9 @@ def identify(scope, hops, kind, marker_info):
         gitdir_hops = hops + [(marker, marker_info)]
     else:
         text = gitdir_text(marker, read_file(marker, marker_info))
-        what = "worktree %s keeps its git dir at %s" % (folder, shown(folder, text))
-        gitdir_hops = walk_git(scope, hops, text, what)
-        require_folder(scope, gitdir_hops, what)
+        gitdir_what = "worktree %s keeps its git dir at %s" % (folder, shown(folder, text))
+        gitdir_hops = walk_git(scope, hops, text, gitdir_what)
+        require_folder(scope, gitdir_hops, gitdir_what)
     gitdir = hop_path(scope, gitdir_hops)
 
     pointer = os.path.join(gitdir, "commondir")
@@ -545,27 +590,20 @@ def identify(scope, hops, kind, marker_info):
         common_hops = walk_git(scope, gitdir_hops, text, what)
         require_folder(scope, common_hops, what)
     common = hop_path(scope, common_hops)
+    if kind == "worktree":
+        require_worktree_gitdir(scope, label, gitdir_what, gitdir_hops, pointer_hops, common_hops)
 
-    configs = []
-    for start, base, name, words in (
-        (common_hops, common, "config", "git config"),
-        (gitdir_hops, gitdir, "config.worktree", "worktree config"),
-    ):
-        path = os.path.join(base, name)
-        found = walk_git(scope, start, name, "%s keeps its %s at %s" % (label, words, path),
-                         missing_ok=True)
-        if found is not None:
-            configs.append((path, found[-1][1]))
-    contents = [(path, read_file(path, info)) for path, info in configs]
-
-    for path, data in contents:
-        refuse_includes(data, folder, path)
-    # config.worktree is read after config, so its value wins, as in git.
+    # Only the common config is read; config.worktree never is. A repo that
+    # turns on per-worktree config is refused instead.
+    config = os.path.join(common, "config")
+    found = walk_git(scope, common_hops, "config",
+                     "%s keeps its git config at %s" % (label, config), missing_ok=True)
     remote = None
-    for path, data in contents:
-        value = origin_remote(data, folder, path)
-        if value is not None:
-            remote = value
+    if found is not None:
+        data = read_file(config, found[-1][1])
+        refuse_includes(data, folder, config)
+        refuse_worktree_config(data, folder, config)
+        remote = origin_remote(data, folder, config)
     if kind == "repo":
         return folder, remote
     parent = os.path.dirname(common) if os.path.basename(common) == ".git" else common

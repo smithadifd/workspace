@@ -83,10 +83,10 @@ Later verbs (`gen` to render the map and settings from the registry,
   from the machine's host name.
 - The code root that the registry names for this host, one level deep: the
   names in that folder, and for each entry whether it holds a `.git` folder or a
-  `.git` file. For each repository it finds, `scan` reads four git files itself:
-  a worktree's `.git` file, the `commondir` file that names the common folder,
-  the `config` there and `config.worktree`. A worktree folds into the repository
-  its common folder belongs to.
+  `.git` file. For each repository it finds, `scan` reads three git files
+  itself: a worktree's `.git` file, the `commondir` file that names the common
+  folder, and the `config` there. A worktree folds into the repository its
+  common folder belongs to.
 - Each of those files is reached by walking its path from the code root one
   step at a time, as written in the file that names it, the way the operating
   system walks it. Every step must exist, must not be a symlink, must stay
@@ -96,14 +96,15 @@ Later verbs (`gen` to render the map and settings from the registry,
   in after the walk is refused rather than read. Any of these ends the scan with
   exit 2.
 - `git` never runs on a repository and is never given a repository path. It
-  only reads the bytes of a `config` or `config.worktree` file passed on its
-  standard input, with includes switched off, with the system and global git
-  config switched off, with every `GIT_` variable from your environment
+  only reads the bytes of a `config` file passed on its standard input, with
+  includes switched off, with the system and global git config switched off,
+  with every `GIT_` variable from your environment
   removed, and from the filesystem root, so the folder you run `scan` from
   plays no part. First `git`'s own parser lists any `[include]` or
   `[includeIf]` key in those bytes: a config with one ends the scan with exit
-  2, and the file it names is never opened. Then `git` reads
-  `remote.origin.url`.
+  2, and the file it names is never opened. A repository that uses
+  per-worktree config (`extensions.worktreeConfig` true) is a could-not-verify:
+  the scan ends with exit 2. Then `git` reads `remote.origin.url`.
 - Symlinks in the code root are followed hop by hop, and only while every hop
   stays inside the code root, outside every excluded path and outside every
   repository (registered, or found directly under the code root).
