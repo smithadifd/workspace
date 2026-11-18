@@ -878,6 +878,23 @@ def test_excluded_git_config_is_unknown_and_git_never_runs_on_it(tmp_path, monke
     assert trace.git_under(odd) == [], trace.git_under(odd)
 
 
+@pytest.mark.parametrize("header", ['[include]', '[includeIf "gitdir:/"]'], ids=["include", "includeIf"])
+def test_git_config_include_is_unknown_and_never_followed(tmp_path, monkeypatch, header):
+    tree = Tree(tmp_path)
+    odd = odd_repo(tree)
+    included = tree.root / "secret" / "included.gitconfig"
+    included.write_text('[remote "origin"]\n\turl = https://example.invalid/acme/sentinel.git\n',
+                        encoding="utf-8")
+    with open(odd / ".git" / "config", "a", encoding="utf-8") as handle:
+        handle.write("%s\n\tpath = %s\n" % (header, included))
+    trace = Trace()
+    code, out = trace.run(monkeypatch, tree)
+    assert_unknown(code, out, "%s: git config includes are not followed" % odd)
+    assert "sentinel" not in out, out
+    assert trace.under(tree.root / "secret") == [], trace.under(tree.root / "secret")
+    assert trace.git_under(odd) == [], "git ran on the repo: %r" % trace.git_under(odd)
+
+
 def alpha_wt_gitdir(tree):
     return tree.root / "alpha" / ".git" / "worktrees" / "alpha-wt"
 

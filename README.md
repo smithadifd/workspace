@@ -92,6 +92,8 @@ Later verbs (`gen` to render the map and settings from the registry,
   `.git` marker, the git folder, the common folder and its config) against the
   excluded list and the code root. A path that fails, or a git or common folder
   reached through a symlink, ends the scan with exit 2, and `git` is not run.
+  So does a git config with an `[include]` or `[includeIf]` section: the files
+  it names are not followed.
 - Symlinks in the code root are followed hop by hop, and only while every hop
   stays inside the code root, outside every excluded path and outside every
   repository (registered, or found directly under the code root).

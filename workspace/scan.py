@@ -64,6 +64,9 @@ REJECTED_EDGE_KEYS = frozenset(("from", "to", "date", "reason"))
 
 URL_REMOTE = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*://(?:[^@/]*@)?([^/]+)(/.*)?$")
 SCP_REMOTE = re.compile(r"^(?:[^@/]+@)?([^:/]+):(?!//)(.+)$")
+# A git config section header that pulls in another file: [include],
+# [includeIf "..."], or the dotted forms. Section names are case-insensitive.
+INCLUDE_SECTION = re.compile(r"^\s*\[\s*include(?:if)?(?![a-z0-9-])", re.IGNORECASE | re.MULTILINE)
 
 REFUSED_EXCLUDED = "excluded path, not read"
 REFUSED_OUTSIDE = "resolves outside the code root"
@@ -381,7 +384,27 @@ def git_dirs(scope, folder, kind):
     worktree_config = os.path.join(gitdir, "config.worktree")
     require_clear(scope, worktree_config,
                   "%s keeps its worktree config at %s" % (label, worktree_config))
+    refuse_includes(folder, (config, worktree_config))
     return gitdir, common
+
+
+def refuse_includes(folder, configs):
+    """Refuse a repo whose config, read as text, pulls in another file.
+
+    Git would follow an include to any path, so an included file cannot be
+    judged without resolving it; it is not resolved, and git is not run.
+    """
+    for path in configs:
+        try:
+            with open(path, encoding="utf-8") as handle:
+                text = handle.read()
+        except FileNotFoundError:
+            continue
+        except (OSError, UnicodeDecodeError) as exc:
+            raise Unverifiable("could not read %s: %s" % (path, exc))
+        if INCLUDE_SECTION.search(text):
+            raise Unverifiable("%s: git config includes are not followed (%s has one); not read"
+                               % (folder, path))
 
 
 def identify(scope, folder, kind):
