@@ -83,40 +83,56 @@ Later verbs (`gen` to render the map and settings from the registry,
   from the machine's host name.
 - The code root that the registry names for this host, one level deep: the
   names in that folder, and for each entry whether it holds a `.git` folder or a
-  `.git` file. For each repository it finds, `git` reads the remote URL from the
-  repository's config, and for a worktree `git rev-parse --git-common-dir` finds
-  its parent. `git` runs with the system and global git config switched off and
-  with every `GIT_` variable from your environment removed.
-- Before `git` runs on a repository, `scan` reads a worktree's `.git` file and
-  its `commondir` file as text, and checks every path `git` would read (the
-  `.git` marker, the git folder, the common folder and its config) against the
-  excluded list and the code root. A path that fails, or a git or common folder
-  reached through a symlink, ends the scan with exit 2, and `git` is not run.
-  So does a git config with an `[include]` or `[includeIf]` section: the files
-  it names are not followed.
+  `.git` file. For each repository it finds, `scan` reads four git files itself:
+  a worktree's `.git` file, the `commondir` file that names the common folder,
+  the `config` there and `config.worktree`. A worktree folds into the repository
+  its common folder belongs to.
+- Each of those files is reached by walking its path from the code root one
+  step at a time, as written in the file that names it, the way the operating
+  system walks it. Every step must exist, must not be a symlink, must stay
+  inside the code root (a `..` step never climbs above it) and must not be an
+  excluded entry. A file is opened without following a symlink, and read only
+  when it is the same regular file the walk found, so a FIFO or a file swapped
+  in after the walk is refused rather than read. Any of these ends the scan with
+  exit 2.
+- `git` never runs on a repository and is never given a repository path. Its
+  one job is to read `remote.origin.url` from the bytes of a `config` or
+  `config.worktree` file passed on its standard input, with `[include]` and
+  `[includeIf]` sections ignored (the files they name are never opened), with
+  the system and global git config switched off, with every `GIT_` variable from
+  your environment removed, and from the filesystem root, so the folder you run
+  `scan` from plays no part.
 - Symlinks in the code root are followed hop by hop, and only while every hop
   stays inside the code root, outside every excluded path and outside every
   repository (registered, or found directly under the code root).
 
 **What it never reads.**
 
-- Any path the registry lists under `excluded`, nor anything under one. An
-  exclusion written as a bare folder, as `folder/*` or as `folder/**` covers that
-  folder and everything beneath it. A path is checked against the excluded list
-  by its text before any file call or `git` command reaches it. That is where you list agent scratch folders, worktree copies, and folders
-  that hold live personal data, such as a rooms folder.
+- Anything beneath a path the registry lists under `excluded`. An exclusion
+  written as a bare folder, as `folder/*` or as `folder/**` covers that folder
+  and everything beneath it. That is where you list agent scratch folders,
+  worktree copies, and folders that hold live personal data, such as a rooms
+  folder.
 - Anything outside the code root, through a symlink or otherwise.
 - The contents of a repository. Nothing inside a repository is listed or opened
-  apart from its `.git` marker and, through `git`, its config, so `.env` files
-  and other secrets in a repository are never read.
+  apart from its `.git` marker and the git files above, so `.env` files and
+  other secrets in a repository are never read.
 
-Paths are compared as written, after `~` expands to your home folder, and
-letter case counts. Write the code root and the excluded paths in the same form
-(both through `~`, or both absolute through the same folder names), because a
-path that reaches the same folder by another name is not recognised as the same
-path: through a symlinked parent, or in different letter case on a
-case-insensitive disk, where an exclusion written `~/Code/private` does not
-match `~/code/private`.
+An excluded path is recognised two ways. By its text, after `~` expands to your
+home folder: a path is checked against the excluded list before any file call
+reaches it. And by identity: `scan` looks up each excluded entry that exists
+(the entry itself, nothing beneath it) and refuses any step of a walk that
+lands on the same folder or file, whatever it is called. So an exclusion
+written `~/Code/private` still covers `~/code/private` on a case-insensitive
+disk, and an exclusion reached through a symlinked parent still covers the
+folder it names. An exclusion that uses a glob character other than the
+trailing `/*` or `/**` names no single entry, so it is matched by its text
+only.
+
+The code root itself is compared by its text. Write it as its real path, with
+no symlinked folder above it: `git` records a worktree's git folder by its real
+path, and a worktree whose git folder does not sit under the code root as
+written ends the scan with exit 2.
 
 **What it writes.** Nothing. `check` and `scan` only read, and neither opens a
 network connection.
@@ -195,10 +211,10 @@ Exit 2 always prints `UNKNOWN` and the reason, and it is never a pass. `scan`
 exits 2 on a registry it cannot read or parse, a field outside the registry's
 grammar, a host missing from `code_roots`, no `--host` when `code_roots` names
 several hosts, a code root it cannot list, a registered path outside the code
-root, under an excluded path or inside another repository, a path `git` would
-read that is excluded, outside the code root or reached through a symlink, and
-any `git` error. An unknown field is refused rather than skipped, so a typo cannot quietly
-turn a rule off.
+root, under an excluded path or inside another repository, a git file whose
+path is excluded, leaves the code root, passes through a symlink or a missing
+step, or that is not a regular file, and any `git` error. An unknown field is
+refused rather than skipped, so a typo cannot quietly turn a rule off.
 
 ## How it is built
 
@@ -210,8 +226,9 @@ copy to show the test fails without it. The `scan` tests build a code root in a
 temp folder with a worktree, a repository nested inside a registered one, a
 declined repository, an archived one on disk, a missing one, a symlink out of
 the root and an excluded folder, and record every path the scan hands to a file
-call or to `git` to prove it never touches the excluded folder, the outside of
-the root, or the inside of a repository.
+call, and every `git` run, to prove it never touches anything beneath the
+excluded folder (by text and by identity), the outside of the root, or the
+inside of a repository, and that `git` is never handed a path.
 
 ```sh
 python3 -m pytest -q
@@ -226,9 +243,13 @@ bash tests/check-workspace-registry.test.sh
   reads when it is present.
 - [AGENTS.md](https://agents.md/): one plain Markdown file any agent can read,
   which is why the map is `AGENTS.md` and `CLAUDE.md` is only a pointer to it.
-- [git worktrees](https://git-scm.com/docs/git-worktree) and
-  `git rev-parse --git-common-dir`: how a worktree is folded into the
+- [git worktrees](https://git-scm.com/docs/git-worktree) and the
+  [repository layout](https://git-scm.com/docs/gitrepository-layout) (the
+  `.git` file and the `commondir` file): how a worktree is folded into the
   repository it belongs to.
+- [git config](https://git-scm.com/docs/git-config) with `--file -` and
+  `--no-includes`: reading one setting from config bytes without following an
+  include.
 - [YAML](https://yaml.org/) through [PyYAML](https://pyyaml.org/), loaded with
   the safe loader and a constructor that refuses duplicate keys, because a
   repeated key in a plain YAML load silently keeps only the last value.
