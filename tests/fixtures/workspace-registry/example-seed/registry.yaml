@@ -1,0 +1,100 @@
+# A synthetic multi-cluster seed: every name here is invented. It stands in
+# for a real system's registry so the check runs against something larger than
+# the two-project fixtures.
+
+system: Example
+harness_root: "$HARNESS_ROOT"
+code_roots:
+  desk: ~/src
+
+excluded:
+  - path: ~/scratch-lanes
+    reason: agent scratch and worktree copies are not projects
+  - path: ~/vault/**
+    reason: live personal data; its code lives under the code root
+
+clusters:
+  - id: shop
+    name: Storefront
+    owner: web team
+    lifecycle: active
+    one_liner: The public shop and its API.
+  - id: data
+    name: Data
+    owner: data team
+    lifecycle: active
+    one_liner: Pipelines and reports.
+  - id: retired
+    name: Retired systems
+    owner: previous team
+    lifecycle: archived
+    one_liner: Systems now owned elsewhere.
+
+projects:
+  - name: shop-web
+    remote: https://example.invalid/acme/shop-web.git
+    paths: {desk: ~/src/shop-web}
+    subpath: null
+    one_liner: Storefront web application.
+    owner: web team
+    owned_or_reference: owned
+    tier: project
+    cluster: shop
+    lifecycle: active
+    doc: null
+    confused_with: "`shop-api` (the browser app, not the API)"
+  - name: shop-api
+    remote: https://example.invalid/acme/shop-api.git
+    paths: {desk: ~/src/shop-api}
+    subpath: null
+    one_liner: Storefront API.
+    owner: web team
+    owned_or_reference: owned
+    tier: project
+    cluster: shop
+    lifecycle: maintenance
+    doc: null
+    confused_with: null
+  - name: ingest
+    remote: https://example.invalid/acme/ingest.git
+    paths: {desk: ~/src/ingest}
+    subpath: null
+    one_liner: Nightly ingest pipeline.
+    owner: data team
+    owned_or_reference: owned
+    tier: project
+    cluster: [data, shop]
+    lifecycle: active
+    doc: docs/ingest.md
+    confused_with: null
+  - name: reports
+    remote: https://example.invalid/acme/reports.git
+    paths: {desk: ~/src/reports}
+    subpath: null
+    one_liner: Weekly reports.
+    owner: data team
+    owned_or_reference: reference
+    tier: project
+    cluster: data
+    lifecycle: active
+    doc: null
+    confused_with: null
+  - name: old-cart
+    remote: https://example.invalid/acme/old-cart.git
+    paths: {desk: ~/src/old-cart}
+    subpath: null
+    one_liner: The previous checkout.
+    owner: previous team
+    owned_or_reference: reference
+    tier: project
+    cluster: retired
+    lifecycle: archived
+    doc: null
+    confused_with: null
+
+edges:
+  - {from: shop-web, to: shop-api, kind: runtime, evidence: SHOP_API_URL, approved_at: 2026-10-06}
+  - {from: reports, to: ingest, kind: source, evidence: reads ingest/out tables, approved_at: 2026-10-06}
+
+declined: []
+rejected_edges: []
