@@ -11,31 +11,42 @@ deep, and reports:
 Without a host, the registry's only `code_roots` host is used; with several it
 is a could-not-verify. The machine's host name is never consulted.
 
-A `.git` file marks a worktree; it folds into its parent, the common dir its
-git files name. Nothing inside a repo is listed. An excluded path, written bare
-or as `folder/*` or `folder/**`, covers the folder and everything beneath it.
+scan gives a verdict only for repos in one plain shape it can read safely, and
+is a could-not-verify for anything else. It does not model any other git or
+filesystem layout:
+
+- a code root entry is a real folder holding a `.git` folder (a repo) or a
+  `.git` regular file (a worktree); an excluded entry is skipped, any other
+  symlink in the code root is a could-not-verify and is never followed;
+- a registered path is walked from the code root with no symlink, and a
+  present one passes the same shape check as a code root entry;
+- a repo's `.git` folder holds no `commondir`;
+- a worktree's `.git` file holds the one line `gitdir: <path>`, naming
+  `<repo>/.git/worktrees/<name>` for a repo found directly in the code root or
+  registered, with a `commondir` file naming `<repo>/.git` and a `HEAD` file;
+  it folds into that repo;
+- the repo's one `config` is a regular file with one link and at most 1 MiB,
+  has no include section, does not turn on per-worktree config, and holds at
+  most one non-empty `remote.origin.url`.
 
 Every path is walked hop by hop from the code root, as the kernel would walk
 it: each hop is judged by its text, then lstat'd and judged by its node
 identity, so an excluded folder is recognised under any spelling that reaches
 it (another letter case on a case-insensitive disk, a symlinked parent). A
 parent step pops a verified hop and never rises above the code root. A symlink
-in the code root is followed only while every hop stays inside the code root,
-outside every excluded path and outside every repo (registered, or found
-directly under the root); a symlink or a missing hop on the way to a repo's git
-files is refused.
+or a missing hop is refused.
 
 scan reads a repo's git files itself: the `.git` file, `commondir` and the
-common `config`, each opened without following a symlink and read only when it
-is the regular file the walk verified. A worktree's git dir must be
-`<common>/worktrees/<name>` holding a `commondir` and a `HEAD` file; any other
-git dir is a could-not-verify. git never runs on a repo: it only reads config
-bytes on its standard input, with includes, the system and global config
-switched off, from the filesystem root. It first lists any include key in those
-bytes (a config with an include section is a could-not-verify; the file it
-names is never followed), then reads `extensions.worktreeConfig` (a repo that
-uses per-worktree config is a could-not-verify; `config.worktree` is never
-read), then reads `remote.origin.url`.
+common `config`, each through one reader that opens it without following a
+symlink and reads it only when it is the regular file the walk verified, with
+one link and at most 1 MiB, and refuses it when it changed during the read.
+git never runs on a repo: it only reads config bytes on its standard input,
+with includes, the system and global config switched off, from the filesystem
+root. It first lists any include key in those bytes (a config with an include
+section is a could-not-verify; the file it names is never followed), then
+reads `extensions.worktreeConfig` (a repo that uses per-worktree config is a
+could-not-verify; `config.worktree` is never read), then reads every
+`remote.origin.url` value.
 
 Writes nothing. No network.
 
@@ -57,9 +68,9 @@ EX_UNKNOWN = 2
 
 REGISTRY_NAME = "registry.yaml"
 LIFECYCLES = frozenset(("active", "maintenance", "deprecated", "sunset", "archived"))
-MAX_LINK_HOPS = 40
 GIT_TIMEOUT_SECONDS = 30
 READ_CHUNK = 65536
+MAX_FILE_BYTES = 1024 * 1024
 
 # The registry grammar (ADR 0036 decision 4, flat keys). A key outside these
 # sets is a could-not-verify, never silently skipped.
@@ -82,9 +93,11 @@ URL_REMOTE = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*://(?:[^@/]*@)?([^/]+)(/.*)?$"
 SCP_REMOTE = re.compile(r"^(?:[^@/]+@)?([^:/]+):(?!//)(.+)$")
 GLOB_MAGIC = re.compile(r"[*?[]")
 
-# The one git call: the remote from config bytes on standard input. No repo
+# The remote from config bytes on standard input: every value, each ended by a
+# NUL, so a value that holds an escaped newline still counts as one. No repo
 # path is ever an argument, and includes are never followed.
-GIT_REMOTE_ARGS = ("config", "--file", "-", "--no-includes", "--get", "remote.origin.url")
+GIT_REMOTE_ARGS = ("config", "--file", "-", "--no-includes", "--null", "--get-all",
+                   "remote.origin.url")
 # Before that, git's own parser lists any include key in the same bytes; an
 # include section is refused, never followed.
 GIT_INCLUDE_ARGS = ("config", "--file", "-", "--no-includes", "--name-only",
@@ -103,11 +116,21 @@ READ_FLAGS = (
 REFUSED_EXCLUDED = "excluded path, not read"
 REFUSED_OUTSIDE = "resolves outside the code root"
 REFUSED_IN_REPO = "inside repo"
-REFUSED_LOOP = "symlink loop"
 NOT_WORKTREE = ("is not a worktree git folder: <common>/worktrees/<name> with commondir "
                 "and HEAD files; not read")
 WORKTREE_CONFIG = ("%s: per-worktree config is not supported (%s sets "
                    "extensions.worktreeConfig true); could not verify")
+ROOT_SYMLINK = ("%s is a symlink in the code root; not followed "
+                "(list it under excluded to skip it)")
+REGISTERED_SYMLINK = "registered path %s: passes through the symlink %s; not followed"
+REPO_COMMONDIR = "repo %s holds %s, which only a worktree's git folder has; not read"
+GITFILE_LINES = "%s holds more than its gitdir line; not read"
+FILE_LINKS = "%s has %d hard links; not read"
+FILE_TOO_BIG = "%s is larger than %d bytes; not read"
+FILE_CHANGED = "%s changed while it was read; not read"
+REMOTE_EMPTY = "%s: remote.origin.url is empty in %s; could not verify"
+REMOTE_MANY = "%s: remote.origin.url is set %d times in %s; could not verify"
+GIT_ODD_OUTPUT = "git gave unexpected output on %s (%s); could not verify"
 
 # Why a walk stopped at a hop that is not judged by the scope.
 HOP_LINK = "link"
@@ -305,7 +328,7 @@ def require_clear(scope, path, what):
 
 
 # --------------------------------------------------------------------------
-# The walk: every path, hop by hop from the code root
+# The walk: every path, hop by hop from the code root, never through a symlink
 # --------------------------------------------------------------------------
 
 def below_root(scope, parts, text):
@@ -316,7 +339,7 @@ def below_root(scope, parts, text):
     return parts[size:]
 
 
-def walk(scope, start, text, links=False, guard_repos=False, missing_ok=False):
+def walk(scope, start, text, guard_repos=False, missing_ok=False):
     """Follow `text` from the folder `start` names, hop by hop, as the kernel would.
 
     `start` is a list of (path, lstat) hops below the code root, each already
@@ -325,17 +348,15 @@ def walk(scope, start, text, links=False, guard_repos=False, missing_ok=False):
     root's own components; a relative one starts at `start`. Each hop is judged
     by its text, then lstat'd and judged by its node identity against every
     excluded entry. A parent step pops the last verified hop and never rises
-    above the code root. A symlink hop is refused, or with `links` its target
-    text is spliced in front of what is left. A missing hop, or a hop that is
-    not a folder with more to walk, is refused, or with `missing_ok` gives None.
-    Returns the hops `text` names; raises Refused.
+    above the code root. A symlink hop is refused. A missing hop, or a hop that
+    is not a folder with more to walk, is refused, or with `missing_ok` gives
+    None. Returns the hops `text` names; raises Refused.
     """
     hops = list(start)
     pending = split_text(text)
     if text.startswith(os.sep):
         pending = below_root(scope, pending, text)
         hops = []
-    followed = 0
     while pending:
         name = pending.pop(0)
         if name == os.pardir:
@@ -359,21 +380,7 @@ def walk(scope, start, text, links=False, guard_repos=False, missing_ok=False):
         if scope.excluded_node(info):
             raise Refused(REFUSED_EXCLUDED, candidate)
         if stat.S_ISLNK(info.st_mode):
-            if not links:
-                raise Refused(HOP_LINK, candidate)
-            followed += 1
-            if followed > MAX_LINK_HOPS:
-                raise Refused(REFUSED_LOOP, candidate)
-            try:
-                target = os.readlink(candidate)
-            except OSError as exc:
-                raise Unverifiable("could not read symlink %s: %s" % (candidate, exc))
-            spliced = split_text(target)
-            if target.startswith(os.sep):
-                spliced = below_root(scope, spliced, target)
-                hops = []
-            pending = spliced + pending
-            continue
+            raise Refused(HOP_LINK, candidate)
         if pending and not stat.S_ISDIR(info.st_mode):
             if missing_ok:
                 return None
@@ -382,16 +389,17 @@ def walk(scope, start, text, links=False, guard_repos=False, missing_ok=False):
     return hops
 
 
-def resolve(scope, path):
-    """Follow a root entry or a registered path, symlinks included.
+def walk_registered(scope, path):
+    """Walk a registered path from the code root: no symlink, nothing inside another repo.
 
-    Returns (hops, refusal): hops is None when the path is absent, and an
-    empty list when it is the code root itself.
+    Returns its hops, or None when it is absent.
     """
     try:
-        return walk(scope, [], path, links=True, guard_repos=True, missing_ok=True), None
+        return walk(scope, [], path, guard_repos=True, missing_ok=True)
     except Refused as refused:
-        return None, refused.reason
+        if refused.reason == HOP_LINK:
+            raise Unverifiable(REGISTERED_SYMLINK % (path, refused.hop))
+        raise Unverifiable("registered path %s: %s" % (path, refused.reason))
 
 
 def walk_git(scope, start, text, what, missing_ok=False):
@@ -416,24 +424,49 @@ def require_folder(scope, hops, what):
 # Reading git files, and the one git call
 # --------------------------------------------------------------------------
 
+def file_state(info):
+    """What must not change while a file is read."""
+    return (info.st_dev, info.st_ino, info.st_nlink, info.st_size,
+            info.st_mtime_ns, info.st_ctime_ns)
+
+
 def read_file(path, info):
-    """The bytes of `path`, the regular file the walk lstat'd as `info`."""
+    """The bytes of `path`, the regular file the walk lstat'd as `info`.
+
+    The only reader of a git file. Nothing is read unless fstat shows that
+    regular file, with one link and at most MAX_FILE_BYTES; the file is refused
+    when a second fstat after the read differs, or the bytes read are not its
+    size. No refusal quotes the bytes.
+    """
     try:
         handle = os.open(path, READ_FLAGS)
     except OSError as exc:
         raise Unverifiable("could not read %s: %s" % (path, exc))
     try:
-        found = os.fstat(handle)
-        if not stat.S_ISREG(found.st_mode):
+        before = os.fstat(handle)
+        if not stat.S_ISREG(before.st_mode):
             raise Unverifiable("%s is not a regular file; not read" % path)
-        if node_of(found) != node_of(info):
-            raise Unverifiable("%s changed while it was read; not read" % path)
+        if node_of(before) != node_of(info):
+            raise Unverifiable(FILE_CHANGED % path)
+        if before.st_nlink != 1:
+            raise Unverifiable(FILE_LINKS % (path, before.st_nlink))
+        if before.st_size > MAX_FILE_BYTES:
+            raise Unverifiable(FILE_TOO_BIG % (path, MAX_FILE_BYTES))
         chunks = []
-        while True:
-            chunk = os.read(handle, READ_CHUNK)
+        total = 0
+        while total <= MAX_FILE_BYTES:
+            chunk = os.read(handle, min(READ_CHUNK, MAX_FILE_BYTES + 1 - total))
             if not chunk:
                 break
             chunks.append(chunk)
+            total += len(chunk)
+        if total > MAX_FILE_BYTES:
+            raise Unverifiable(FILE_TOO_BIG % (path, MAX_FILE_BYTES))
+        after = os.fstat(handle)
+        if file_state(after) != file_state(before):
+            raise Unverifiable(FILE_CHANGED % path)
+        if total != before.st_size:
+            raise Unverifiable(FILE_CHANGED % path)
         return b"".join(chunks)
     except OSError as exc:
         raise Unverifiable("could not read %s: %s" % (path, exc))
@@ -501,14 +534,27 @@ def refuse_worktree_config(data, folder, path):
 
 
 def origin_remote(data, folder, path):
-    """remote.origin.url from config bytes, or None; git sees only the bytes."""
+    """remote.origin.url from config bytes, or None; git sees only the bytes.
+
+    Absent is None; exactly one non-empty value is the remote; an empty value,
+    more than one value, or any other git result is a could-not-verify.
+    """
     result = run_git(GIT_REMOTE_ARGS, data, folder, path)
-    if result.returncode == 0:
-        return result.stdout.decode("utf-8", "replace").strip() or None
     if result.returncode == 1:
+        if result.stdout:
+            raise Unverifiable(GIT_ODD_OUTPUT % (folder, path))
         return None
-    raise Unverifiable("git error on %s (%s): %s"
-                       % (folder, path, result.stderr.decode("utf-8", "replace").strip()))
+    if result.returncode != 0:
+        raise git_failure(result, folder, path)
+    if not result.stdout.endswith(b"\0"):
+        raise Unverifiable(GIT_ODD_OUTPUT % (folder, path))
+    values = result.stdout[:-1].split(b"\0")
+    if len(values) != 1:
+        raise Unverifiable(REMOTE_MANY % (folder, len(values), path))
+    value = values[0].decode("utf-8", "replace").strip()
+    if not value:
+        raise Unverifiable(REMOTE_EMPTY % (folder, path))
+    return value
 
 
 def git_marker(scope, folder):
@@ -531,10 +577,28 @@ def git_marker(scope, folder):
 
 
 def gitdir_text(marker, data):
-    first = os.fsdecode(data.split(b"\n", 1)[0]).strip()
+    """The path a `.git` file names: its one non-empty line, `gitdir: <path>`."""
+    lines = data.split(b"\n")
+    first = os.fsdecode(lines[0]).strip()
     if not first.startswith("gitdir:") or not first[len("gitdir:"):].strip():
         raise Unverifiable("%s does not name a gitdir" % marker)
+    if any(line not in (b"", b"\r") for line in lines[1:]):
+        raise Unverifiable(GITFILE_LINES % marker)
     return first[len("gitdir:"):].strip()
+
+
+def require_known_repo_worktrees(known, what, gitdir_hops):
+    """A worktree's git dir is `<repo>/.git/worktrees/<name>`, `<repo>` a known repo.
+
+    `known` maps each repo folder found directly in the code root or
+    registered to its node identity. This is judged on the verified hops,
+    before anything in the git dir is read.
+    """
+    if (len(gitdir_hops) < 4
+            or os.path.basename(gitdir_hops[-2][0]) != "worktrees"
+            or os.path.basename(gitdir_hops[-3][0]) != ".git"
+            or known.get(gitdir_hops[-4][0]) != node_of(gitdir_hops[-4][1])):
+        raise Unverifiable("%s, which %s" % (what, NOT_WORKTREE))
 
 
 def require_worktree_gitdir(scope, label, what, gitdir_hops, pointer_hops, common_hops):
@@ -558,7 +622,7 @@ def require_worktree_gitdir(scope, label, what, gitdir_hops, pointer_hops, commo
         raise refused
 
 
-def identify(scope, hops, kind, marker_info):
+def identify(scope, hops, kind, marker_info, known):
     """Return (parent repo path, remote) for the repo or worktree `hops` names.
 
     Every git file is walked to and judged before any is read, and every read
@@ -569,41 +633,47 @@ def identify(scope, hops, kind, marker_info):
     marker = os.path.join(folder, ".git")
     if kind == "repo":
         gitdir_hops = hops + [(marker, marker_info)]
+        # Only a worktree's git folder has a commondir; a repo's never does.
+        pointer = os.path.join(marker, "commondir")
+        if walk_git(scope, gitdir_hops, "commondir",
+                    "%s keeps its commondir file at %s" % (label, pointer),
+                    missing_ok=True) is not None:
+            raise Unverifiable(REPO_COMMONDIR % (folder, pointer))
+        common_hops = gitdir_hops
     else:
         text = gitdir_text(marker, read_file(marker, marker_info))
         gitdir_what = "worktree %s keeps its git dir at %s" % (folder, shown(folder, text))
         gitdir_hops = walk_git(scope, hops, text, gitdir_what)
         require_folder(scope, gitdir_hops, gitdir_what)
-    gitdir = hop_path(scope, gitdir_hops)
+        require_known_repo_worktrees(known, gitdir_what, gitdir_hops)
+        gitdir = hop_path(scope, gitdir_hops)
 
-    pointer = os.path.join(gitdir, "commondir")
-    pointer_hops = walk_git(scope, gitdir_hops, "commondir",
-                            "%s keeps its commondir file at %s" % (label, pointer),
-                            missing_ok=True)
-    if pointer_hops is None:
-        common_hops = gitdir_hops
-    else:
-        text = os.fsdecode(read_file(pointer, pointer_hops[-1][1])).rstrip("\r\n")
-        if not text:
-            raise Unverifiable("%s names no common dir" % pointer)
-        what = "%s has its common dir at %s" % (label, shown(gitdir, text))
-        common_hops = walk_git(scope, gitdir_hops, text, what)
-        require_folder(scope, common_hops, what)
-    common = hop_path(scope, common_hops)
-    if kind == "worktree":
+        pointer = os.path.join(gitdir, "commondir")
+        pointer_hops = walk_git(scope, gitdir_hops, "commondir",
+                                "%s keeps its commondir file at %s" % (label, pointer),
+                                missing_ok=True)
+        if pointer_hops is None:
+            common_hops = None
+        else:
+            text = os.fsdecode(read_file(pointer, pointer_hops[-1][1])).rstrip("\r\n")
+            if not text:
+                raise Unverifiable("%s names no common dir" % pointer)
+            what = "%s has its common dir at %s" % (label, shown(gitdir, text))
+            common_hops = walk_git(scope, gitdir_hops, text, what)
+            require_folder(scope, common_hops, what)
         require_worktree_gitdir(scope, label, gitdir_what, gitdir_hops, pointer_hops, common_hops)
+    common = hop_path(scope, common_hops)
 
     # Only the common config is read; config.worktree never is. A repo that
-    # turns on per-worktree config is refused instead.
+    # turns on per-worktree config is refused instead. A missing config is
+    # refused, never read as "no remote".
     config = os.path.join(common, "config")
     found = walk_git(scope, common_hops, "config",
-                     "%s keeps its git config at %s" % (label, config), missing_ok=True)
-    remote = None
-    if found is not None:
-        data = read_file(config, found[-1][1])
-        refuse_includes(data, folder, config)
-        refuse_worktree_config(data, folder, config)
-        remote = origin_remote(data, folder, config)
+                     "%s keeps its git config at %s" % (label, config))
+    data = read_file(config, found[-1][1])
+    refuse_includes(data, folder, config)
+    refuse_worktree_config(data, folder, config)
+    remote = origin_remote(data, folder, config)
     if kind == "repo":
         return folder, remote
     parent = os.path.dirname(common) if os.path.basename(common) == ".git" else common
@@ -821,11 +891,10 @@ def scan(workspace, host):
     except OSError as exc:
         raise Unverifiable("code root %s cannot be listed: %s" % (root, exc))
 
-    # Pass 1: the folders directly under the root. Symlinks wait for pass 2,
-    # so every repo here is known before any link is followed.
+    # The code root's entries: an excluded entry is skipped, any other symlink
+    # is a could-not-verify, and a folder is looked inside for its .git marker.
     scope = Scope(root, info, exclusions, nodes, sorted(registered))
     candidates = []
-    links = []
     for name in names:
         entry = os.path.join(root, name)
         refusal = scope.refusal(entry)
@@ -842,31 +911,36 @@ def scan(workspace, host):
             lines.append("SKIP   %s: %s" % (entry, REFUSED_EXCLUDED))
             continue
         if stat.S_ISLNK(entry_info.st_mode):
-            links.append(entry)
-            continue
+            raise Unverifiable(ROOT_SYMLINK % entry)
         if not stat.S_ISDIR(entry_info.st_mode):
             continue
         kind, marker_info = git_marker(scope, entry)
         if kind is not None:
             candidates.append((entry, [(entry, entry_info)], kind, marker_info))
 
-    # Pass 2: a link is followed only while it stays clear of every repo,
-    # registered or found in pass 1.
-    scope.repo_paths = sorted(set(registered) | {hops[-1][0] for _, hops, _, _ in candidates})
-    for entry in links:
-        hops, refusal = resolve(scope, entry)
-        if refusal:
-            lines.append("SKIP   %s: symlink %s" % (entry, refusal))
-            continue
-        if not hops or not stat.S_ISDIR(hops[-1][1].st_mode):
-            continue
-        kind, marker_info = git_marker(scope, hops[-1][0])
-        if kind is not None:
-            candidates.append((entry, hops, kind, marker_info))
+    # The registered paths, walked with no symlink and clear of every repo,
+    # registered or found in the code root. A present one that is not also a
+    # code root entry is judged by the same shape check.
+    scope.repo_paths = sorted(set(registered) | {entry for entry, _, _, _ in candidates})
+    in_root = {entry for entry, _, _, _ in candidates}
+    present = {}
+    for path in sorted(registered):
+        hops = walk_registered(scope, path)
+        kind = None
+        if hops and stat.S_ISDIR(hops[-1][1].st_mode):
+            kind, marker_info = git_marker(scope, hops[-1][0])
+        present[path] = kind is not None
+        if kind is not None and path not in in_root:
+            candidates.append((path, hops, kind, marker_info))
+
+    # Every repo a worktree may belong to is known before any is identified,
+    # so the order of the entries never matters.
+    known = {hops[-1][0]: node_of(hops[-1][1])
+             for _, hops, kind, _ in candidates if kind == "repo"}
 
     found = {}
     for entry, hops, kind, marker_info in candidates:
-        parent, remote = identify(scope, hops, kind, marker_info)
+        parent, remote = identify(scope, hops, kind, marker_info, known)
         if kind == "worktree":
             lines.append("INFO   worktree %s folds into %s" % (entry, parent))
         record = found.setdefault(parent, {"remote": None, "seen": []})
@@ -888,16 +962,8 @@ def scan(workspace, host):
         lines.append("DRIFT  unregistered repo at %s (%s)" % (parent, shown_remote))
 
     for path in sorted(registered):
-        hops, refusal = resolve(scope, path)
-        if refusal:
-            raise Unverifiable("registered path %s: %s" % (path, refusal))
-        present = (
-            bool(hops)
-            and stat.S_ISDIR(hops[-1][1].st_mode)
-            and git_marker(scope, hops[-1][0])[0] is not None
-        )
         for project in registered[path]:
-            if present:
+            if present[path]:
                 if project["lifecycle"] == "archived":
                     lines.append("KNOWN  archived project `%s` is present at %s"
                                  % (project["name"], path))

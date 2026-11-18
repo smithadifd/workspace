@@ -9,12 +9,16 @@ Every fixture is built in a temp dir with synthetic names. The tree:
       gamma/                  declined by remote
       legacy/                 registered, archived, present on disk
       secret/                 an excluded path (a repo with a private file)
-      lane-link -> alpha/lanes/lane-1
-      ext-link  -> ../outside/delta-clone      (resolves outside the root)
-      sneaky    -> secret                      (in-root link into the excluded path)
       notes.txt, plain/       not repos
     outside/delta-clone/      a repo outside the code root
     ws/registry.yaml          alpha, legacy, delta (missing) [, epsilon (missing, required_on)]
+
+A symlink in the code root is a could-not-verify, so the tree holds none unless
+a test asks for one by name (`links`):
+
+      lane-link -> alpha/lanes/lane-1
+      ext-link  -> ../outside/delta-clone      (resolves outside the root)
+      sneaky    -> secret                      (in-root link into the excluded path)
 """
 import builtins
 import errno
@@ -26,6 +30,8 @@ import socket
 import stat
 import subprocess
 import sys
+import time
+import types
 from pathlib import Path
 
 import pytest
@@ -77,8 +83,15 @@ def project(root, name, lifecycle="active", **extra):
     return entry
 
 
+LINKS = {
+    "lane-link": lambda tree: Path("alpha") / "lanes" / "lane-1",
+    "ext-link": lambda tree: tree.outside / "delta-clone",
+    "sneaky": lambda tree: Path("secret"),
+}
+
+
 class Tree:
-    def __init__(self, base, beta=False, epsilon=False):
+    def __init__(self, base, beta=False, epsilon=False, links=()):
         self.base = base
         self.root = base / "code"
         self.outside = base / "outside"
@@ -96,9 +109,8 @@ class Tree:
         make_repo(root / "secret", REMOTE % "secret")
         (root / "secret" / "private.txt").write_text("never read\n", encoding="utf-8")
         make_repo(self.outside / "delta-clone", REMOTE % "delta-clone")
-        (root / "lane-link").symlink_to(Path("alpha") / "lanes" / "lane-1")
-        (root / "ext-link").symlink_to(self.outside / "delta-clone")
-        (root / "sneaky").symlink_to(Path("secret"))
+        for name in links:
+            (root / name).symlink_to(LINKS[name](self))
         (root / "notes.txt").write_text("not a repo\n", encoding="utf-8")
         (root / "plain").mkdir()
 
@@ -259,9 +271,6 @@ def test_conforming_tree_passes_with_every_line_named(tmp_path):
     for line in (
         "host `testhost`, code root %s" % root,
         "SKIP   %s: excluded path, not read" % (root / "secret"),
-        "SKIP   %s: symlink excluded path, not read" % (root / "sneaky"),
-        "SKIP   %s: symlink resolves outside the code root" % (root / "ext-link"),
-        "SKIP   %s: symlink inside repo %s" % (root / "lane-link", root / "alpha"),
         "INFO   worktree %s folds into %s" % (root / "alpha-wt", root / "alpha"),
         "INFO   declined repo at %s (example.invalid/acme/gamma)" % (root / "gamma"),
         "KNOWN  archived project `legacy` is present at %s" % (root / "legacy"),
@@ -283,13 +292,12 @@ def test_worktree_folds_into_its_parent(tmp_path):
 
 
 def test_nested_lane_repo_is_never_entered(tmp_path, monkeypatch):
-    tree = Tree(tmp_path)
+    # A symlink in the code root into the nested repo is a could-not-verify
+    # (declared change: it was a SKIP line), and is never followed.
+    tree = Tree(tmp_path, links=("lane-link",))
     trace = Trace()
     code, out = trace.run(monkeypatch, tree)
-    assert code == 0, out
-    assert "lane-1" not in "\n".join(drift_lines(out)), out
-    assert "SKIP   %s: symlink inside repo %s" % (
-        tree.root / "lane-link", tree.root / "alpha") in out, out
+    assert_unknown(code, out, scan.ROOT_SYMLINK % (tree.root / "lane-link"))
     touched = trace.under(tree.root / "alpha" / "lanes")
     assert touched == [], "scan touched inside a registered repo: %r" % touched
 
@@ -326,15 +334,14 @@ def test_missing_host_path_named_by_required_on_is_drift(tmp_path):
     ], out
 
 
-def test_out_of_root_symlink_is_skipped_and_never_followed(tmp_path, monkeypatch):
-    tree = Tree(tmp_path)
+def test_out_of_root_symlink_is_unknown_and_never_followed(tmp_path, monkeypatch):
+    # Declared change: a symlink in the code root was a SKIP line; it is now exit 2.
+    tree = Tree(tmp_path, links=("ext-link",))
     trace = Trace()
     code, out = trace.run(monkeypatch, tree)
-    assert code == 0, out
-    assert "SKIP   %s: symlink resolves outside the code root" % (tree.root / "ext-link") in out, out
+    assert_unknown(code, out, scan.ROOT_SYMLINK % (tree.root / "ext-link"))
     touched = trace.under(tree.outside)
     assert touched == [], "scan touched outside the code root: %r" % touched
-    assert "delta-clone" not in "\n".join(drift_lines(out)), out
 
 
 def test_nothing_beneath_an_excluded_path_is_touched(tmp_path, monkeypatch):
@@ -654,12 +661,18 @@ def test_code_root_that_cannot_be_listed_is_unknown(tmp_path):
     assert_unknown(code, out, "code root %s cannot be listed" % tree.root)
 
 
-def test_registered_path_that_links_outside_is_unknown(tmp_path):
+def test_registered_path_that_links_outside_is_unknown(tmp_path, monkeypatch):
+    # Declared change: the link was followed and refused as outside; now the
+    # symlink hop itself is refused, and nothing outside is touched.
     tree = Tree(tmp_path)
-    tree.registry["projects"].append(project(tree.root, "ext-link"))
+    link = tree.root / "plain" / "ext-link"
+    link.symlink_to(tree.outside / "delta-clone")
+    tree.registry["projects"].append(project(tree.root, "ext-link", paths={HOST: str(link)}))
     tree.write_registry()
-    assert_unknown(*run_scan(tree), "registered path %s: resolves outside the code root"
-                   % (tree.root / "ext-link"))
+    trace = Trace()
+    code, out = trace.run(monkeypatch, tree)
+    assert_unknown(code, out, scan.REGISTERED_SYMLINK % (link, link))
+    assert trace.under(tree.outside) == [], trace.under(tree.outside)
 
 
 def test_git_marker_that_is_a_symlink_is_unknown(tmp_path):
@@ -720,10 +733,6 @@ def test_registered_remote_matches_in_scp_form(tmp_path):
     code, out = run_scan(tree)
     assert code == 0, out
     assert drift_lines(out) == [], out
-    # alpha is a repo on disk though not a registered path here: the link into
-    # its nested lane repo is still not followed.
-    assert "SKIP   %s: symlink inside repo %s" % (
-        tree.root / "lane-link", tree.root / "alpha") in out, out
 
 
 def test_declined_remote_glob_matches(tmp_path):
@@ -904,7 +913,6 @@ def test_excluded_glob_forms_cover_the_folder_and_everything_beneath(tmp_path, m
     code, out = trace.run(monkeypatch, tree)
     assert code == 0, out
     assert "SKIP   %s: excluded path, not read" % secret in out, out
-    assert "SKIP   %s: symlink excluded path, not read" % (tree.root / "sneaky") in out, out
     touched = trace.beneath(secret)
     assert touched == [], "scan touched beneath the excluded path: %r" % touched
     assert "secret" not in "\n".join(drift_lines(out)), out
@@ -1013,8 +1021,12 @@ def test_worktree_config_file_is_never_touched(tmp_path, monkeypatch):
 
 
 def synthetic_worktree(tree, common):
-    """A worktree `odd` whose git dir sits in the code root and names `common`."""
-    gitdir = tree.root / "plain" / "odd-meta"
+    """A worktree `odd` whose git dir is alpha/.git/worktrees/odd and names `common`.
+
+    The git dir is under a known repo's worktrees folder, so the common dir
+    walk is reached.
+    """
+    gitdir = tree.root / "alpha" / ".git" / "worktrees" / "odd"
     gitdir.mkdir()
     (gitdir / "HEAD").write_text("ref: refs/heads/main\n", encoding="utf-8")
     (gitdir / "commondir").write_text("%s\n" % common, encoding="utf-8")
@@ -1166,16 +1178,17 @@ def test_git_dir_that_is_a_file_is_unknown(tmp_path):
 
 
 def test_commondir_text_through_a_symlink_is_unknown_and_not_followed(tmp_path, monkeypatch):
-    # stray's commondir names an in-root symlink into the excluded repo.
-    tree = stray_tree(tmp_path)
-    stray = tree.root / "stray"
+    # alpha-wt's commondir names an in-root symlink into the excluded repo. (A
+    # repo's .git holding a commondir is refused before it is read.)
+    tree = Tree(tmp_path)
+    worktree = tree.root / "alpha-wt"
     link = tree.root / "plain" / "lnk"
     link.symlink_to(Path("..") / "secret" / ".git")
-    (stray / ".git" / "commondir").write_text("%s\n" % link, encoding="utf-8")
+    (alpha_wt_gitdir(tree) / "commondir").write_text("%s\n" % link, encoding="utf-8")
     trace = Trace()
     code, out = trace.run(monkeypatch, tree)
-    assert_unknown(code, out, "repo %s has its common dir at %s, which passes through the "
-                   "symlink %s; not followed" % (stray, link, link))
+    assert_unknown(code, out, "worktree %s has its common dir at %s, which passes through the "
+                   "symlink %s; not followed" % (worktree, link, link))
     assert "acme/secret" not in out, out
     assert trace.beneath(tree.root / "secret") == [], trace.beneath(tree.root / "secret")
 
@@ -1224,8 +1237,9 @@ def test_git_config_that_is_a_fifo_is_unknown_and_does_not_hang(tmp_path):
 
 
 def test_commondir_that_is_a_fifo_is_unknown_and_does_not_hang(tmp_path):
-    tree = stray_tree(tmp_path)
-    pointer = tree.root / "stray" / ".git" / "commondir"
+    tree = Tree(tmp_path)
+    pointer = alpha_wt_gitdir(tree) / "commondir"
+    pointer.unlink()
     os.mkfifo(pointer)
     code, out = run_cli("scan", str(tree.ws), "--host", HOST, timeout=FIFO_TIMEOUT_SECONDS)
     assert_unknown(code, out, "%s is not a regular file; not read" % pointer)
@@ -1290,7 +1304,8 @@ def test_git_config_with_a_non_utf8_comment_is_read(tmp_path):
 # The one git call: config bytes on stdin, from the filesystem root
 # --------------------------------------------------------------------------
 
-GIT_REMOTE_CALL = ["git", "config", "--file", "-", "--no-includes", "--get", "remote.origin.url"]
+GIT_REMOTE_CALL = ["git", "config", "--file", "-", "--no-includes", "--null", "--get-all",
+                   "remote.origin.url"]
 GIT_INCLUDE_CALL = ["git", "config", "--file", "-", "--no-includes", "--name-only",
                     "--get-regexp", r"^(include|includeif)\."]
 GIT_WORKTREE_CONFIG_CALL = ["git", "config", "--file", "-", "--no-includes", "--type=bool",
@@ -1370,7 +1385,6 @@ def assert_secret_skipped_by_identity(tree, code, out, trace):
     secret = tree.root / "secret"
     assert code == 0, out
     assert "SKIP   %s: excluded path, not read" % secret in out.splitlines(), out
-    assert "SKIP   %s: symlink excluded path, not read" % (tree.root / "sneaky") in out.splitlines(), out
     assert "secret" not in "\n".join(drift_lines(out)), out
     assert trace.beneath(secret) == [], "scan read beneath the excluded path: %r" % trace.beneath(secret)
 
@@ -1398,16 +1412,16 @@ def test_excluded_path_through_a_linked_parent_is_matched_by_identity(tmp_path, 
 
 
 def test_common_dir_in_another_letter_case_is_matched_by_identity(tmp_path, monkeypatch):
-    # stray's commondir names <root>/SECRET/.git; the excluded folder is secret.
-    tree = stray_tree(tmp_path)
-    stray = tree.root / "stray"
+    # alpha-wt's commondir names <root>/SECRET/.git; the excluded folder is secret.
+    tree = Tree(tmp_path)
+    worktree = tree.root / "alpha-wt"
     common = tree.root / "SECRET" / ".git"
-    (stray / ".git" / "commondir").write_text("%s\n" % common, encoding="utf-8")
+    (alpha_wt_gitdir(tree) / "commondir").write_text("%s\n" % common, encoding="utf-8")
     fold_case(monkeypatch, tree.root, "secret")
     trace = Trace()
     code, out = trace.run(monkeypatch, tree)
-    assert_unknown(code, out, "repo %s has its common dir at %s, which is excluded; not read"
-                   % (stray, common))
+    assert_unknown(code, out, "worktree %s has its common dir at %s, which is excluded; not read"
+                   % (worktree, common))
     assert "acme/secret" not in out, out
     assert trace.beneath(tree.root / "secret") == [], trace.beneath(tree.root / "secret")
 
@@ -1511,9 +1525,19 @@ def head_folder(tree):
     head.mkdir()
 
 
+def cross_common_meta(tree):
+    """alpha/.git/worktrees/cross, with HEAD, whose commondir names gamma's .git."""
+    meta = tree.root / "alpha" / ".git" / "worktrees" / "cross"
+    meta.mkdir()
+    (meta / "HEAD").write_text("ref: refs/heads/main\n", encoding="utf-8")
+    (meta / "commondir").write_text("%s\n" % (tree.root / "gamma" / ".git"), encoding="utf-8")
+    return meta
+
+
 @pytest.mark.parametrize(
     "case",
-    ["checkout", "git-dir", "lookalike", "sibling-folder", "no-head", "head-folder"],
+    ["checkout", "git-dir", "lookalike", "sibling-folder", "no-head", "head-folder",
+     "cross-common"],
 )
 def test_git_dir_that_is_not_a_worktree_folder_is_unknown_and_does_not_fold(tmp_path, case):
     tree = Tree(tmp_path)
@@ -1529,6 +1553,8 @@ def test_git_dir_that_is_not_a_worktree_folder_is_unknown_and_does_not_fold(tmp_
             text = str(root / "alpha" / ".git")
         elif case == "sibling-folder":
             text = str(sibling_meta(tree))
+        elif case == "cross-common":
+            text = str(cross_common_meta(tree))
         else:
             text = str(lookalike_meta(tree))
         worktree = worktree_file(tree, text)
@@ -1537,3 +1563,465 @@ def test_git_dir_that_is_not_a_worktree_folder_is_unknown_and_does_not_fold(tmp_
                    "folder: <common>/worktrees/<name> with commondir and HEAD files; not read"
                    % (worktree, text))
     assert "folds into" not in out, out
+
+
+# --------------------------------------------------------------------------
+# The plain shape: no symlink in the code root or in a registered path
+# --------------------------------------------------------------------------
+
+LINK_REACH = {
+    "lane-link": lambda tree: ("under", tree.root / "alpha" / "lanes"),
+    "ext-link": lambda tree: ("under", tree.outside),
+    "sneaky": lambda tree: ("beneath", tree.root / "secret"),
+}
+
+
+@pytest.mark.parametrize("name", sorted(LINKS))
+def test_symlink_in_the_code_root_is_unknown_and_never_followed(tmp_path, monkeypatch, name):
+    # Declared change: a symlink in the code root was followed hop by hop, or
+    # printed a SKIP line. Now it ends the scan, and its target is never read.
+    tree = Tree(tmp_path, links=(name,))
+    trace = Trace()
+    code, out = trace.run(monkeypatch, tree)
+    assert_unknown(code, out, "%s is a symlink in the code root; not followed "
+                   "(list it under excluded to skip it)" % (tree.root / name))
+    assert [path for call, path in trace.calls if call == "readlink"] == [], trace.calls
+    how, base = LINK_REACH[name](tree)
+    touched = trace.under(base) if how == "under" else trace.beneath(base)
+    assert touched == [], "scan followed the symlink: %r" % touched
+
+
+def test_excluded_symlink_in_the_code_root_is_skipped(tmp_path, monkeypatch):
+    # The exclusion check comes before the symlink check.
+    tree = Tree(tmp_path, links=("sneaky",))
+    exclude(tree, tree.root / "sneaky")
+    trace = Trace()
+    code, out = trace.run(monkeypatch, tree)
+    assert code == 0, out
+    assert "SKIP   %s: excluded path, not read" % (tree.root / "sneaky") in out.splitlines(), out
+    assert trace.beneath(tree.root / "secret") == [], trace.beneath(tree.root / "secret")
+
+
+def test_registered_path_through_a_symlink_is_unknown(tmp_path, monkeypatch):
+    # By its target the registered path is gamma, a repo in the code root.
+    tree = Tree(tmp_path)
+    link = tree.root / "plain" / "lnk"
+    link.symlink_to(Path("..") / "gamma")
+    tree.registry["projects"].append(project(tree.root, "gamma-alias", paths={HOST: str(link)}))
+    tree.write_registry()
+    trace = Trace()
+    code, out = trace.run(monkeypatch, tree)
+    assert_unknown(code, out, "registered path %s: passes through the symlink %s; not followed"
+                   % (link, link))
+
+
+def test_git_dir_excluded_by_a_glob_is_refused_by_its_text(tmp_path, monkeypatch):
+    # A glob names no single entry, so its text is the only guard.
+    tree = Tree(tmp_path)
+    tree.registry["excluded"] = [{"path": str(tree.root / "secr?t"), "reason": "fixture"}]
+    tree.write_registry()
+    meta = secret_worktree_meta(tree)
+    odd = worktree_file(tree, meta)
+    trace = Trace()
+    code, out = trace.run(monkeypatch, tree)
+    assert_unknown(code, out, "worktree %s keeps its git dir at %s, which is excluded; not read"
+                   % (odd, meta))
+    assert trace.beneath(tree.root / "secret") == [], trace.beneath(tree.root / "secret")
+
+
+# --------------------------------------------------------------------------
+# The plain shape: a repo's .git folder has no commondir
+# --------------------------------------------------------------------------
+
+@pytest.mark.parametrize("kind", ["file", "folder", "fifo"])
+def test_repo_git_folder_holding_commondir_is_unknown_and_not_read(tmp_path, monkeypatch, kind):
+    # Declared change: it was followed. Here stray's would name alpha's .git and
+    # give the unregistered repo a registered remote.
+    tree = stray_tree(tmp_path)
+    stray = tree.root / "stray"
+    pointer = stray / ".git" / "commondir"
+    if kind == "file":
+        pointer.write_text("%s\n" % (tree.root / "alpha" / ".git"), encoding="utf-8")
+    elif kind == "folder":
+        pointer.mkdir()
+    else:
+        os.mkfifo(pointer)
+    trace = Trace()
+    code, out = trace.run(monkeypatch, tree)
+    assert_unknown(code, out, "repo %s holds %s, which only a worktree's git folder has; "
+                   "not read" % (stray, pointer))
+    assert trace.opened(pointer) == [], trace.opened(pointer)
+
+
+# --------------------------------------------------------------------------
+# The plain shape: a .git file is the one gitdir line
+# --------------------------------------------------------------------------
+
+@pytest.mark.parametrize(
+    "tail",
+    ["gitdir: {gamma}\n", "more\n", "\n# note\n"],
+    ids=["second-gitdir", "second-line", "after-a-blank-line"],
+)
+def test_git_file_with_more_than_its_gitdir_line_is_unknown(tmp_path, tail):
+    tree = Tree(tmp_path)
+    marker = tree.root / "alpha-wt" / ".git"
+    marker.write_text("gitdir: %s\n" % alpha_wt_gitdir(tree)
+                      + tail.format(gamma=tree.root / "gamma" / ".git"), encoding="utf-8")
+    code, out = run_scan(tree)
+    assert_unknown(code, out, "%s holds more than its gitdir line; not read" % marker)
+    assert "folds into" not in out, out
+
+
+@pytest.mark.parametrize("ending", ["", "\n", "\r\n", "\n\n"],
+                         ids=["no-newline", "newline", "crlf", "blank-line"])
+def test_git_file_line_endings_still_fold(tmp_path, ending):
+    tree = Tree(tmp_path)
+    marker = tree.root / "alpha-wt" / ".git"
+    marker.write_bytes(("gitdir: %s%s" % (alpha_wt_gitdir(tree), ending)).encode("utf-8"))
+    code, out = run_scan(tree)
+    assert code == 0, out
+    assert "INFO   worktree %s folds into %s" % (tree.root / "alpha-wt", tree.root / "alpha") in out, out
+
+
+def test_git_file_whose_first_line_is_not_gitdir_is_unknown(tmp_path):
+    tree = Tree(tmp_path)
+    marker = tree.root / "alpha-wt" / ".git"
+    marker.write_text("\ngitdir: %s\n" % alpha_wt_gitdir(tree), encoding="utf-8")
+    assert_unknown(*run_scan(tree), "%s does not name a gitdir" % marker)
+
+
+# --------------------------------------------------------------------------
+# The one reader: one link, at most 1 MiB, unchanged across the read
+# --------------------------------------------------------------------------
+
+CAP = 1024 * 1024
+SENTINEL_REMOTE = "https://example.invalid/acme/sentinel.git"
+
+
+class ReadSpy:
+    """Counts the opens of `path` and every os.read on a descriptor it was opened as."""
+
+    def __init__(self, monkeypatch, path):
+        self.path = str(path)
+        self.fds = set()
+        self.opened = 0
+        self.reads = 0
+        real_open, real_read, real_close = os.open, os.read, os.close
+
+        def spy_open(name, *args, **kwargs):
+            fd = real_open(name, *args, **kwargs)
+            if os.fsdecode(name) == self.path:
+                self.opened += 1
+                self.fds.add(fd)
+            return fd
+
+        def spy_read(fd, *args, **kwargs):
+            if fd in self.fds:
+                self.reads += 1
+            return real_read(fd, *args, **kwargs)
+
+        def spy_close(fd):
+            self.fds.discard(fd)
+            return real_close(fd)
+
+        monkeypatch.setattr(os, "open", spy_open)
+        monkeypatch.setattr(os, "read", spy_read)
+        monkeypatch.setattr(os, "close", spy_close)
+
+
+def excluded_twin(tree, text):
+    """A file in the excluded folder holding `text`, to be hard linked into a repo."""
+    twin = tree.root / "secret" / "twin"
+    twin.write_text(text, encoding="utf-8")
+    return twin
+
+
+def hardlinked_config(tree):
+    twin = excluded_twin(tree, '[remote "origin"]\n\turl = %s\n' % SENTINEL_REMOTE)
+    config = tree.root / "stray" / ".git" / "config"
+    config.unlink()
+    os.link(twin, config)
+    return config
+
+
+def hardlinked_git_file(tree):
+    twin = excluded_twin(tree, "gitdir: %s\n" % (tree.root / "sentinel"))
+    odd = tree.root / "odd"
+    odd.mkdir()
+    os.link(twin, odd / ".git")
+    return odd / ".git"
+
+
+def hardlinked_commondir(tree):
+    twin = excluded_twin(tree, "%s\n" % (tree.root / "sentinel" / ".git"))
+    pointer = alpha_wt_gitdir(tree) / "commondir"
+    pointer.unlink()
+    os.link(twin, pointer)
+    return pointer
+
+
+HARDLINKED = {
+    "config": hardlinked_config,
+    "git-file": hardlinked_git_file,
+    "commondir": hardlinked_commondir,
+}
+
+
+@pytest.mark.parametrize("which", sorted(HARDLINKED))
+def test_hardlinked_git_file_is_unknown_and_never_read(tmp_path, monkeypatch, which):
+    # Declared change: it was read. The link aliases a file in the excluded
+    # folder; none of its bytes is read, so its sentinel text never prints.
+    tree = stray_tree(tmp_path)
+    path = HARDLINKED[which](tree)
+    spy = ReadSpy(monkeypatch, path)
+    code, out = run_scan(tree)
+    assert_unknown(code, out, "%s has 2 hard links; not read" % path)
+    assert "sentinel" not in out, out
+    assert spy.opened == 1, spy.opened
+    assert spy.reads == 0, "scan read %d time(s) from the hard-linked file" % spy.reads
+
+
+def test_git_config_larger_than_the_cap_is_unknown(tmp_path):
+    tree = stray_tree(tmp_path)
+    config = tree.root / "stray" / ".git" / "config"
+    with open(config, "a", encoding="utf-8") as handle:
+        handle.write("# " + "x" * CAP + "\n")
+    assert_unknown(*run_scan(tree), "%s is larger than %d bytes; not read" % (config, CAP))
+
+
+def test_git_config_at_the_cap_is_read(tmp_path):
+    tree = stray_tree(tmp_path)
+    config = tree.root / "stray" / ".git" / "config"
+    size = config.stat().st_size
+    with open(config, "a", encoding="utf-8") as handle:
+        handle.write("# " + "x" * (CAP - size - 3) + "\n")
+    assert config.stat().st_size == CAP
+    assert_stray_is_drift(tree)
+
+
+def test_git_config_rewritten_while_it_is_read_is_unknown(tmp_path, monkeypatch):
+    # A writer rewrites stray's config in place, same inode and same size,
+    # between the reader's reads. The file's times are aged first, so a
+    # coarse timestamp cannot hide the rewrite.
+    tree = stray_tree(tmp_path)
+    config = tree.root / "stray" / ".git" / "config"
+    data = config.read_bytes()
+    rewritten = data.replace(b"bare = false", b"bare = FALSE")
+    assert rewritten != data and len(rewritten) == len(data), data
+    aged = time.time() - 3600
+    os.utime(config, (aged, aged))
+    real_open, real_read = os.open, os.read
+    fds = set()
+    rewrote = []
+
+    def spy_open(name, *args, **kwargs):
+        fd = real_open(name, *args, **kwargs)
+        if os.fsdecode(name) == str(config):
+            fds.add(fd)
+        return fd
+
+    def rewriting_read(fd, *args, **kwargs):
+        chunk = real_read(fd, *args, **kwargs)
+        if fd in fds and chunk and not rewrote:
+            rewrote.append(fd)
+            with builtins.open(config, "r+b") as handle:
+                handle.write(rewritten)
+        return chunk
+
+    monkeypatch.setattr(os, "open", spy_open)
+    monkeypatch.setattr(os, "read", rewriting_read)
+    code, out = run_scan(tree)
+    assert rewrote, "the config was never read"
+    assert_unknown(code, out, "%s changed while it was read; not read" % config)
+
+
+def test_short_read_is_unknown(tmp_path, monkeypatch):
+    # fstat reports the same file before and after, but fewer bytes arrive
+    # than its size: the bytes are not the file.
+    path = tmp_path / "config"
+    path.write_bytes(b"0123456789")
+    info = os.lstat(path)
+    same = types.SimpleNamespace(
+        st_mode=info.st_mode, st_dev=info.st_dev, st_ino=info.st_ino, st_nlink=1,
+        st_size=10, st_mtime_ns=1, st_ctime_ns=1,
+    )
+    chunks = [b"012", b""]
+    monkeypatch.setattr(os, "fstat", lambda fd: same)
+    monkeypatch.setattr(os, "read", lambda fd, size: chunks.pop(0))
+    with pytest.raises(scan.Unverifiable) as caught:
+        scan.read_file(str(path), info)
+    assert str(caught.value) == "%s changed while it was read; not read" % path
+
+
+# --------------------------------------------------------------------------
+# The plain shape: one config, present, with at most one origin URL
+# --------------------------------------------------------------------------
+
+def test_repo_without_a_git_config_is_unknown(tmp_path):
+    # Declared change: it was "no remote".
+    tree = stray_tree(tmp_path)
+    stray = tree.root / "stray"
+    config = stray / ".git" / "config"
+    config.unlink()
+    assert_unknown(*run_scan(tree), "repo %s keeps its git config at %s, which does not exist "
+                   "(no %s); not read" % (stray, config, config))
+
+
+def add_to_config(tree, text):
+    config = tree.root / "stray" / ".git" / "config"
+    with open(config, "a", encoding="utf-8") as handle:
+        handle.write(text)
+    return config
+
+
+def test_origin_url_set_more_than_once_is_unknown(tmp_path):
+    # Declared change: git's last value was used.
+    tree = stray_tree(tmp_path)
+    config = add_to_config(tree, '[remote "origin"]\n\turl = %s\n\turl = %s\n'
+                           % (REMOTE % "alpha", REMOTE % "stray"))
+    assert_unknown(*run_scan(tree), "%s: remote.origin.url is set 2 times in %s; could not verify"
+                   % (tree.root / "stray", config))
+
+
+@pytest.mark.parametrize("line", ["\turl =\n", "\turl\n"], ids=["empty", "bare-key"])
+def test_empty_origin_url_is_unknown(tmp_path, line):
+    # Declared change: it read as "no remote".
+    tree = stray_tree(tmp_path)
+    config = add_to_config(tree, '[remote "origin"]\n' + line)
+    assert_unknown(*run_scan(tree), "%s: remote.origin.url is empty in %s; could not verify"
+                   % (tree.root / "stray", config))
+
+
+def test_origin_url_holding_an_escaped_newline_is_one_value(tmp_path):
+    tree = stray_tree(tmp_path)
+    add_to_config(tree, '[remote "origin"]\n\turl = "https://example.invalid/acme/stray\\n.git"\n')
+    code, out = run_scan(tree)
+    assert code == 1, out
+    assert "UNKNOWN" not in out, out
+    assert "DRIFT  unregistered repo at %s (https://example.invalid/acme/stray\n" % (
+        tree.root / "stray") in out, out
+
+
+@pytest.mark.parametrize("answer", ["printf 'x'; exit 0", "printf 'x'; exit 1"],
+                         ids=["no-nul", "output-on-exit-1"])
+def test_unexpected_git_output_for_the_remote_is_unknown(tmp_path, monkeypatch, answer):
+    # The shim stands in for a git whose remote answer is not the NUL-ended form.
+    tree = stray_tree(tmp_path)
+    git_shim(tmp_path, monkeypatch,
+             'case "$*" in *remote.origin.url*) %s;; esac' % answer)
+    assert_unknown(*run_scan(tree), "git gave unexpected output on %s (%s); could not verify"
+                   % (tree.root / "alpha", tree.root / "alpha" / ".git" / "config"))
+
+
+# --------------------------------------------------------------------------
+# A registered path at any depth passes the same shape check
+# --------------------------------------------------------------------------
+
+def register_nested(tree, nested):
+    tree.registry["projects"].append(project(tree.root, "nested", paths={HOST: str(nested)}))
+    tree.write_registry()
+
+
+def test_nested_registered_repo_in_the_plain_shape_passes(tmp_path):
+    tree = Tree(tmp_path)
+    nested = tree.root / "plain" / "nested"
+    make_repo(nested, REMOTE % "nested")
+    register_nested(tree, nested)
+    code, out = run_scan(tree)
+    assert code == 0, out
+    assert "PASS  no drift (1 warn)" in out, out
+
+
+@pytest.mark.parametrize(
+    "case", ["worktree-config", "include", "commondir", "malformed-git-file"],
+)
+def test_nested_registered_path_outside_the_plain_shape_is_unknown(tmp_path, case):
+    # Declared change: a registered path below a code root entry was only
+    # checked for a .git marker, so each of these passed.
+    tree = Tree(tmp_path)
+    nested = tree.root / "plain" / "nested"
+    if case == "malformed-git-file":
+        nested.mkdir()
+        (nested / ".git").write_text("nonsense\n", encoding="utf-8")
+        reason = "%s does not name a gitdir" % (nested / ".git")
+    else:
+        make_repo(nested, REMOTE % "nested")
+        config = nested / ".git" / "config"
+        if case == "worktree-config":
+            # What `git sparse-checkout init` writes.
+            with open(config, "a", encoding="utf-8") as handle:
+                handle.write("[extensions]\n\tworktreeConfig = true\n")
+            reason = ("%s: per-worktree config is not supported (%s sets "
+                      "extensions.worktreeConfig true); could not verify" % (nested, config))
+        elif case == "include":
+            with_include(config, "[include]", tree.root / "secret" / "included.gitconfig")
+            reason = ("%s: git config includes are not followed (%s has one); not read"
+                      % (nested, config))
+        else:
+            pointer = nested / ".git" / "commondir"
+            pointer.write_text("%s\n" % (tree.root / "alpha" / ".git"), encoding="utf-8")
+            reason = ("repo %s holds %s, which only a worktree's git folder has; not read"
+                      % (nested, pointer))
+    register_nested(tree, nested)
+    assert_unknown(*run_scan(tree), reason)
+
+
+# --------------------------------------------------------------------------
+# A worktree's git dir is <repo>/.git/worktrees/<name>, <repo> a known repo
+# --------------------------------------------------------------------------
+
+def not_a_worktree(worktree, text):
+    return ("worktree %s keeps its git dir at %s, which is not a worktree git folder: "
+            "<common>/worktrees/<name> with commondir and HEAD files; not read" % (worktree, text))
+
+
+def test_worktree_git_dir_inside_a_working_tree_is_unknown_and_not_read(tmp_path, monkeypatch):
+    # alpha/src/worktrees/x looks like a worktree git dir whose common dir is
+    # alpha/src, a folder in alpha's working tree. Nothing there is opened.
+    tree = Tree(tmp_path)
+    src = tree.root / "alpha" / "src"
+    meta = src / "worktrees" / "x"
+    meta.mkdir(parents=True)
+    (meta / "HEAD").write_text("ref: refs/heads/main\n", encoding="utf-8")
+    (meta / "commondir").write_text("../..\n", encoding="utf-8")
+    (src / "config").write_text('[remote "origin"]\n\turl = %s\n' % SENTINEL_REMOTE,
+                                encoding="utf-8")
+    odd = worktree_file(tree, meta)
+    trace = Trace()
+    code, out = trace.run(monkeypatch, tree)
+    assert_unknown(code, out, not_a_worktree(odd, meta))
+    assert trace.opened(src) == [], "scan opened inside a working tree: %r" % trace.opened(src)
+
+
+def test_worktree_of_an_unregistered_repo_below_the_code_root_is_unknown(tmp_path):
+    # Declared change: it folded into its repo, reported as unregistered drift.
+    tree = Tree(tmp_path)
+    nested = tree.root / "plain" / "nested"
+    make_repo(nested, REMOTE % "nested", commit=True)
+    git("-C", nested, "worktree", "add", "-q", tree.root / "nested-wt")
+    gitdir = nested / ".git" / "worktrees" / "nested-wt"
+    assert_unknown(*run_scan(tree), not_a_worktree(tree.root / "nested-wt", gitdir))
+
+
+def test_worktree_of_a_nested_registered_repo_folds(tmp_path):
+    tree = Tree(tmp_path)
+    nested = tree.root / "plain" / "nested"
+    make_repo(nested, REMOTE % "nested", commit=True)
+    git("-C", nested, "worktree", "add", "-q", tree.root / "nested-wt")
+    register_nested(tree, nested)
+    code, out = run_scan(tree)
+    assert code == 0, out
+    assert "INFO   worktree %s folds into %s" % (tree.root / "nested-wt", nested) in out, out
+
+
+def test_worktree_named_before_its_repo_folds(tmp_path):
+    tree = Tree(tmp_path)
+    zz = tree.root / "zz"
+    make_repo(zz, REMOTE % "zz", commit=True)
+    git("-C", zz, "worktree", "add", "-q", tree.root / "aa-wt")
+    code, out = run_scan(tree)
+    assert code == 1, out
+    assert drift_lines(out) == [
+        "DRIFT  unregistered repo at %s (example.invalid/acme/zz)" % zz
+    ], out
+    assert "INFO   worktree %s folds into %s" % (tree.root / "aa-wt", zz) in out, out
