@@ -80,8 +80,13 @@ MAX_FILE_BYTES = 1024 * 1024
 # sets is a could-not-verify, never silently skipped.
 TOP_KEYS = frozenset((
     "system", "harness_root", "code_roots", "excluded", "clusters",
-    "projects", "edges", "declined", "rejected_edges",
+    "projects", "edges", "declined", "rejected_edges", "session_prompt",
 ))
+# The SessionStart prompt opt-in (see `session_prompt`).
+SESSION_PROMPT_KEY = "session_prompt"
+SESSION_PROMPT_ON = "on"
+SESSION_PROMPT_NOT_ON = ("registry `session_prompt` is set but not to `on`, so the "
+                         "SessionStart prompt stays off")
 PROJECT_KEYS = frozenset((
     "name", "remote", "paths", "subpath", "one_liner", "owner",
     "owned_or_reference", "tier", "cluster", "lifecycle", "doc",
@@ -920,6 +925,45 @@ def load_registry(workspace):
     return parse_registry(registry_snapshot(workspace).data)
 
 
+def registry_text(data):
+    """The registry bytes as text, with line ends as reading the file in text mode gives them."""
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise Unverifiable("could not read registry: %s" % exc)
+    return text.replace("\r\n", "\n").replace("\r", "\n")
+
+
+def session_prompt(data):
+    """Whether the registry bytes turn the SessionStart prompt on: (on, note).
+
+    The grammar has one accepted form: the top-level key `session_prompt`
+    whose value is the scalar text `on`, plain or quoted. The key absent is
+    off, with no note. Any other value is off, and the note names that:
+    another case (`On`, `ON`), another word YAML reads as true (`true`,
+    `yes`), extra text inside quotes (`'on '`), no value, a list or a mapping.
+    YAML 1.1 loads a plain `on` as the boolean true, the same value as `yes`
+    and `true`, so the text is read from the parsed node, never from the
+    loaded value. Another case of the key itself is outside the registry
+    grammar, so `validate` refuses it. The bytes are ones `parse_registry`
+    has already accepted.
+    """
+    from workspace.check import UniqueKeyLoader, yaml
+
+    try:
+        node = yaml.compose(registry_text(data), Loader=UniqueKeyLoader)
+    except yaml.YAMLError as exc:
+        raise Unverifiable("registry is not parseable YAML: %s" % exc)
+    if not isinstance(node, yaml.MappingNode):
+        return False, None
+    for key, value in node.value:
+        if isinstance(key, yaml.ScalarNode) and key.value == SESSION_PROMPT_KEY:
+            if isinstance(value, yaml.ScalarNode) and value.value == SESSION_PROMPT_ON:
+                return True, None
+            return False, SESSION_PROMPT_NOT_ON
+    return False, None
+
+
 def parse_registry(data):
     """The registry document from the bytes of one `registry_snapshot`."""
     from workspace.check import (
@@ -929,12 +973,7 @@ def parse_registry(data):
         yaml,
     )
 
-    try:
-        text = data.decode("utf-8")
-    except UnicodeDecodeError as exc:
-        raise Unverifiable("could not read registry: %s" % exc)
-    # Line ends as reading the file in text mode gave them.
-    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    text = registry_text(data)
     if not text.strip():
         raise Unverifiable("registry is empty")
     try:

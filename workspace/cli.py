@@ -6,11 +6,15 @@
     workspace register WORKSPACE PATH --cluster ID --one-liner TEXT [--name NAME]
                        [--lifecycle LIFECYCLE] [--host HOST] [--write --expect HASH]
     workspace decline WORKSPACE PATTERN --reason TEXT [--write --expect HASH]
+    workspace prompt [--snooze DAYS]
 
 WORKSPACE is the workspace folder that holds `registry.yaml`, the map and
 `.claude/settings.json`. `check` and `scan` only read. `gen`, `register` and
 `decline` print a plan and its hash and write nothing; with `--write --expect
 HASH` they write exactly the plan whose hash is HASH.
+
+`prompt` takes no WORKSPACE: the opt-in SessionStart hook runs it in the
+workspace folder. It always exits 0 and prints at most one line.
 
 Exit codes: 0 conforms or done, 1 gap, drift or refusal, 2 could not verify, 3 usage.
 """
@@ -28,6 +32,7 @@ Usage: workspace check WORKSPACE
        workspace register WORKSPACE PATH --cluster ID --one-liner TEXT [--name NAME]
                           [--lifecycle LIFECYCLE] [--host HOST] [--write --expect HASH]
        workspace decline WORKSPACE PATTERN --reason TEXT [--write --expect HASH]
+       workspace prompt [--snooze DAYS]
        workspace --version
 
   check     prove the registry, the map and .claude/settings.json agree
@@ -38,6 +43,9 @@ Usage: workspace check WORKSPACE
             this host's .code-workspace file from the registry
   register  add the repository at PATH to the registry
   decline   record a remote or path pattern the registry should not propose
+  prompt    run in the workspace folder by the opt-in SessionStart hook: at
+            most one line naming unregistered repos, once a day; --snooze
+            DAYS keeps it quiet; always exits 0
 
 WORKSPACE is the folder holding registry.yaml, the map (AGENTS.md, or
 CLAUDE.md) and .claude/settings.json. check and scan only read. gen,
@@ -262,4 +270,9 @@ def main(argv=None):
         from workspace import register
 
         return register.decline_main(request)
+    if verb == "prompt":
+        # No usage error: the hook's verb exits 0 and prints at most one line.
+        from workspace import prompt
+
+        return prompt.main(rest)
     return usage_error("unknown verb %s" % verb)

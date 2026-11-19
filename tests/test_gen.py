@@ -1385,7 +1385,8 @@ EDGES_PROMISE = (
     "number, never the line. `gen`, `register` and `decline` print a plan and a plan hash and write "
     "nothing; run again with `--write --expect <hash>` to write exactly that plan. `gen` writes the "
     "map, the `CLAUDE.md` pointer, `.claude/settings.json` (only the code roots and the deny rules "
-    "for excluded paths, never a `sandbox` block), the per-host `.code-workspace` file and its own "
+    "for excluded paths, and, only if you turn it on, one SessionStart hook that runs "
+    "`workspace prompt`, never a `sandbox` block), the per-host `.code-workspace` file and its own "
     "manifest, and what it writes always passes `check`. `register` and `decline` change only "
     "`registry.yaml`. Nothing here opens a network connection."
 )
