@@ -15,10 +15,11 @@ What cannot be read is a WARN line, never a could-not-verify: the drift
 verdict stands. A symlink or an excluded entry is counted on one INFO line.
 Evidence is a path and a line number, never the line's text. It is kept
 raw, as the real path, and each sink encodes it for itself: `register`
-stores it quoted for YAML, and a path from inside a repository is printed
-with every backslash and every character that is not printable escaped, so
-a file name cannot start a line of its own or send control bytes to the
-terminal.
+stores it quoted for YAML with every character outside printable ASCII
+escaped, and a path from inside a repository is printed, here and in
+`register`'s plan, with every backslash and every character that is not
+printable escaped, so a file name cannot start a line of its own or send
+control bytes to the terminal.
 """
 import os
 import re
@@ -53,7 +54,10 @@ PY_SYS_PATH = re.compile(r"sys\.path\.(?:insert|append)\(")
 PY_IMPORT = re.compile(r"^\s*(?:from|import)\s+([A-Za-z_][\w.]*)")
 CAPS_IDENTIFIER = re.compile(r"(?<![A-Za-z0-9_])([A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+)(?![A-Za-z0-9_])")
 URL_HOST = re.compile(r"\b(?:https?|wss?)://([A-Za-z0-9][A-Za-z0-9-]*)")
-EVIDENCE_FORM = re.compile(r"^\S+:[0-9]+$")
+# Stored evidence is raw: the real path, then `:LINE`. A path may hold a
+# newline, a tab or a line separator, but not a plain space; evidence with a
+# space is prose, as it was when evidence was stored escaped.
+EVIDENCE_FORM = re.compile(r"[^ ]+:[0-9]+")
 
 CANDIDATE_LINE = "WARN   candidate %s → %s (%s) %s"
 STALE_LINE = "WARN   stale %s → %s (%s) %s"
@@ -299,7 +303,7 @@ def scan_lines(state):
     for entry in document.get("edges") or []:
         origin, target, kind = entry.get("from"), entry.get("to"), entry.get("kind")
         evidence = entry.get("evidence")
-        if not isinstance(evidence, str) or not EVIDENCE_FORM.match(evidence):
+        if not isinstance(evidence, str) or not EVIDENCE_FORM.fullmatch(evidence):
             prose += 1
             continue
         if origin not in walked:

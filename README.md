@@ -211,7 +211,10 @@ file. A file written takes its mode from that one read: it is never more
 permissive than the file it replaces, and a new `AGENTS.md` whose keep blocks
 come from `CLAUDE.md` takes `CLAUDE.md`'s mode. A file with neither gets the
 usual mode for your umask. Edge evidence is stored in `registry.yaml` as the
-real path and line number; only what is printed to the terminal is escaped.
+real path and line number, quoted with every character outside printable ASCII
+escaped so that it reads back as that path; what is printed to the terminal,
+`register`'s plan included, has every backslash and every character that is not
+printable escaped.
 
 In `.claude/settings.json`, `gen` owns only the code roots in
 `permissions.additionalDirectories`, a Read and an Edit deny rule for each
@@ -272,12 +275,15 @@ These are not covered:
   symlinked folder above it (such as `/tmp` on macOS), is followed. Write the
   code root as its real path.
 - Just before `gen`, `register` or `decline` renames a new file into place, it
-  looks the name up again, without following a symlink, and refuses unless it
-  is still the file it read (or still absent). A writer that changes the file
-  between that look-up and the rename is not caught. It cannot redirect the
-  write or bring other bytes in, because a rename replaces the folder entry
-  and never writes through a symlink, and the folder is held open; it can only
-  lose its own change to that file.
+  looks the name up again, without following a symlink, reads it again, and
+  refuses unless it is still the file it read, with the same bytes, identity
+  and mode (or still absent), so an edit in place is refused too. This byte
+  recheck narrows the window between that recheck and the rename, which was
+  there before it; a writer that changes the file inside that window is still
+  not caught. Only a concurrent edit by the same user can do that. It cannot
+  redirect the write or bring other bytes in, because a rename replaces the
+  folder entry and never writes through a symlink, and the folder is held
+  open; it can only lose its own change to that file.
 
 ## Install
 

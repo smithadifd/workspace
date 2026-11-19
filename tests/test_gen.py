@@ -1570,6 +1570,65 @@ def test_a_target_swapped_just_before_its_rename_is_not_replaced(tmp_path, monke
     assert leftovers == []
 
 
+def test_a_keep_block_edited_in_place_just_before_its_rename_is_not_overwritten(
+        tmp_path, monkeypatch):
+    ws, hand, plan = swapped_after_the_plan(tmp_path, monkeypatch)
+    before = os.stat(ws.file("AGENTS.md"))
+    original = gen.write_atomic
+    calls = []
+
+    def editing(folder, name, *rest):
+        # After the recheck: the pending manifest is the first write, before any rename.
+        result = original(folder, name, *rest)
+        calls.append(name)
+        if len(calls) == 1:
+            with open(ws.file("AGENTS.md"), "r+b") as handle:
+                data = handle.read()
+                handle.seek(0)
+                handle.write(data.replace(b"mine\n", b"MINE\n"))
+            edited = os.stat(ws.file("AGENTS.md"))
+            # The same file, edited in place: same inode, same mode.
+            assert (edited.st_ino, edited.st_mode) == (before.st_ino, before.st_mode)
+        return result
+
+    monkeypatch.setattr(gen, "write_atomic", editing)
+    buffer = io.StringIO()
+    code = gen.write_plan(str(ws.path), plan, buffer)
+    out = buffer.getvalue()
+    assert code == 2, out
+    assert "AGENTS.md changed since the plan read it" in out, out
+    assert ws.read("AGENTS.md") == hand.replace("mine\n", "MINE\n")
+    leftovers = [name for name in contents(ws.path) if name.endswith(gen.TEMP_SUFFIX)]
+    assert leftovers == []
+
+
+def test_a_stop_at_the_first_record_removes_the_folders_it_made(tmp_path, monkeypatch):
+    ws = WS(tmp_path, monkeypatch)
+    before = contents(ws.path)
+    code, out = run(ws)
+    with monkeypatch.context() as patch:
+        Fault(patch, gen.MANIFEST_NAME, nth=1)
+        code, out = run(ws, expect=plan_hash(out))
+    assert code == 2, out
+    assert contents(ws.path) == before, sorted(contents(ws.path))
+    generate(ws)
+
+
+def test_a_stop_after_the_pending_record_keeps_the_folder_that_holds_it(tmp_path, monkeypatch):
+    ws = WS(tmp_path, monkeypatch)
+    code, out = run(ws)
+    with monkeypatch.context() as patch:
+        Fault(patch, gen.MANIFEST_NAME, nth=2)
+        code, out = run(ws, expect=plan_hash(out))
+    assert code == 2, out
+    assert "the write stopped part way" in out, out
+    assert "pending" in ws.read("state/gen-desk.json")
+    leftovers = [name for name in contents(ws.path) if name.endswith(gen.TEMP_SUFFIX)]
+    assert leftovers == []
+    generate(ws)
+    assert "pending" not in ws.read(".workspace-gen.json")
+
+
 def test_a_new_map_takes_the_mode_of_its_keep_source(tmp_path, monkeypatch, umask_022):
     ws = WS(tmp_path, monkeypatch)
     ws.write("CLAUDE.md", keep_text(top="private notes\n"))

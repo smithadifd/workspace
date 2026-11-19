@@ -549,6 +549,14 @@ def test_one_liner_with_yaml_characters_round_trips(tmp_path, monkeypatch):
     assert load(reg)["projects"][-1]["one_liner"] == "Tool #1: *fast* & safe"
 
 
+def test_non_ascii_one_liner_is_stored_as_ascii_and_round_trips(tmp_path, monkeypatch):
+    one_liner = "Caf\u00e9 \U0001f600 \"quoted\" back\\slash"
+    reg = Reg(tmp_path, monkeypatch)
+    registered(reg, "~/src/new", one_liner=one_liner)
+    assert reg.text().isascii(), reg.text()
+    assert load(reg)["projects"][-1]["one_liner"] == one_liner
+
+
 def test_nulls_and_dates_are_typed(tmp_path, monkeypatch):
     reg = Reg(tmp_path, monkeypatch)
     reg.put("new/run.sh", "source ~/src/shop-web/lib.sh\n")
@@ -856,7 +864,18 @@ def test_registry_swapped_for_a_link_at_the_lock_is_not_written(tmp_path, monkey
         return result
 
     monkeypatch.setattr(register.fcntl, "flock", flock)
+    temps = []
+    real_write_temp = gen.write_temp
+
+    def write_temp(*args):
+        temps.append(args[1])
+        return real_write_temp(*args)
+
+    monkeypatch.setattr(gen, "write_temp", write_temp)
     refused(*run_decline(reg, "~/src/tmp-*", expect=digest), register.PLAN_CHANGED)
+    # The check under the lock refuses before any write begins: no temp file is
+    # made. write_atomic's own look-up would refuse too, but only after its temp.
+    assert temps == []
     assert os.readlink(registry) == str(moved)
     assert moved.read_text(encoding="utf-8") == REGISTRY
     assert stat.S_IMODE(moved.stat().st_mode) == 0o600
@@ -904,6 +923,83 @@ def test_a_linked_registry_is_never_replaced_by_a_regular_file(tmp_path, monkeyp
     assert os.readlink(reg.ws / "registry.yaml") == str(real)
     assert real.read_text(encoding="utf-8") == REGISTRY
     assert stat.S_IMODE(real.stat().st_mode) == 0o600
+
+
+@pytest.mark.parametrize("char", ["\u0085", "\u007f", "\u009b", "\u2028", "\u202e"])
+def test_evidence_with_yaml_breaks_and_controls_is_stored_escaped_and_parses_raw(
+        tmp_path, monkeypatch, char):
+    reg = Reg(tmp_path, monkeypatch)
+    rel = "lib/a%sb.py" % char
+    reg.put("new/" + rel, "import shop_web\n")
+    registered(reg, "~/src/new")
+    text = reg.text()
+    assert char not in text, repr(text)
+    assert "\\u%04x" % ord(char) in text, text
+    drafted = [edge for edge in load(reg)["edges"] if edge["from"] == "new"]
+    assert [edge["evidence"] for edge in drafted] == [rel + ":1"], drafted
+    path, line = drafted[0]["evidence"].rsplit(":", 1)
+    assert (reg.root / "new" / path).is_file()
+
+
+def test_a_line_separator_name_leaves_later_registers_working(tmp_path, monkeypatch):
+    reg = Reg(tmp_path, monkeypatch)
+    reg.put("new/a\u2028b.py", "import shop_web\n")
+    registered(reg, "~/src/new")
+    make_repo(reg.root / "other", REMOTE % "other")
+    reg.put("other/run.sh", "source ~/src/shop-web/lib.sh\n")
+    registered(reg, "~/src/other")
+    drafted = {edge["from"]: edge["evidence"] for edge in load(reg)["edges"]}
+    assert drafted["new"] == "a\u2028b.py:1" and drafted["other"] == "run.sh:1", drafted
+
+
+def test_a_raw_line_separator_already_in_the_registry_does_not_cut_the_splice(
+        tmp_path, monkeypatch):
+    # YAML reads U+2028 inside a quoted scalar as part of the value; the splice
+    # must cut lines on the newline character only, or it splits that line.
+    text = REGISTRY.replace(
+        "evidence: polls it,", 'evidence: "a\u2028b.sh:1",')
+    reg = Reg(tmp_path, monkeypatch, text)
+    assert load(reg)["edges"][0]["evidence"] == "a\u2028b.sh:1"
+    reg.put("new/run.sh", "source ~/src/shop-web/lib.sh\n")
+    registered(reg, "~/src/new")
+    found = load(reg)["edges"]
+    assert [edge["evidence"] for edge in found] == ["a\u2028b.sh:1", "run.sh:1"], found
+
+
+def test_the_plan_prints_evidence_escaped_and_stores_it_raw(tmp_path, monkeypatch):
+    # The last edge already holds a raw U+202E (hand-written, or written by an
+    # earlier version), so it is diff context in the plan.
+    text = REGISTRY.replace("evidence: polls it,", 'evidence: "old\u202egnp.sh:1",')
+    reg = Reg(tmp_path, monkeypatch, text)
+    reg.put("new/lib/\u202egnp.py", "import shop_web\n")
+    reg.put("new/\u2028x.py", "import ingest\n")
+    code, out = run_register(reg, "~/src/new")
+    assert code == 0, out
+    for char in ("\u202e", "\u2028"):
+        assert char not in out, repr(out)
+    assert "old\\u202egnp.sh:1" in out, out
+    assert "lib/\\\\u202egnp.py:1" in out and "\\\\u2028x.py:1" in out, out
+    registered(reg, "~/src/new")
+    stored = {edge["to"]: edge["evidence"] for edge in load(reg)["edges"]
+              if edge["from"] == "new"}
+    assert stored == {"shop-web": "lib/\u202egnp.py:1", "ingest": "\u2028x.py:1"}, stored
+
+
+@pytest.mark.parametrize("verb", ["register", "decline"])
+def test_an_unreadable_workspace_says_could_not_read_registry_once(tmp_path, monkeypatch,
+                                                                     verb):
+    reg = Reg(tmp_path, monkeypatch)
+    reg.ws.chmod(0)
+    try:
+        if verb == "register":
+            code, out = run_register(reg, "~/src/new")
+        else:
+            code, out = run_decline(reg, "~/src/tmp-*")
+    finally:
+        reg.ws.chmod(0o755)
+    assert code == 2, out
+    assert "UNKNOWN  could not read registry: " in out, out
+    assert out.count("could not read registry") == 1, out
 
 
 def test_stored_evidence_is_the_real_path(tmp_path, monkeypatch):

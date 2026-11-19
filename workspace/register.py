@@ -24,14 +24,15 @@ without following a symlink, and must be a regular file, or the verb refuses
 with exit 1. The confirmed write re-opens it the same way, locks it, checks
 that the name is still that file and still holds the planned bytes, and the
 new file takes the locked file's mode. Drafted edge evidence is stored as the
-real path and line, quoted for YAML; only the plan's terminal output escapes.
+real path and line, quoted for YAML with every character outside printable
+ASCII escaped, so it parses back to that path; the plan's terminal output
+escapes every line through `edges.printable`.
 
 Exit codes: 0 planned or written, 1 refused, 2 could not verify.
 """
 import copy
 import datetime
 import fcntl
-import json
 import os
 import re
 import stat
@@ -58,8 +59,26 @@ class Refusal(gen.Refusal):
 
 
 def quoted(value):
-    """A YAML double-quoted scalar: JSON's escaping is valid YAML."""
-    return json.dumps(value, ensure_ascii=False)
+    """A YAML double-quoted scalar holding only printable ASCII.
+
+    A double quote and a backslash are escaped, and so is every character
+    outside printable ASCII: as `\\uXXXX`, or `\\UXXXXXXXX` above U+FFFF (YAML
+    takes both, and JSON's surrogate pairs would parse back as two characters).
+    So a character YAML refuses raw (U+007F, the C1 controls) or reads as a
+    line break (U+0085, U+2028, U+2029) parses back to itself.
+    """
+    shown = []
+    for char in value:
+        code = ord(char)
+        if char in ('"', "\\"):
+            shown.append("\\" + char)
+        elif 0x20 <= code < 0x7F:
+            shown.append(char)
+        elif code <= 0xFFFF:
+            shown.append("\\u%04x" % code)
+        else:
+            shown.append("\\U%08x" % code)
+    return '"%s"' % "".join(shown)
 
 
 def scalar(value):
@@ -85,7 +104,7 @@ def splice(text, key, entries):
     """`text` with `entries` added at the end of the top-level list `key`, every other byte kept."""
     if not entries:
         return text
-    lines = text.splitlines(keepends=True)
+    lines = newline_lines(text)
     start = None
     for index, line in enumerate(lines):
         match = TOP_KEY.match(line.rstrip("\r\n"))
@@ -133,6 +152,20 @@ def splice(text, key, entries):
     return before + rendered + "".join(lines[last + 1:])
 
 
+def newline_lines(text):
+    """`text` cut after each newline character (U+000A) only, each piece keeping it.
+
+    Never `splitlines()`: it also cuts at U+0085, U+2028 and others, which
+    can sit inside a quoted value on one registry line.
+    """
+    pieces = text.split("\n")
+    last = pieces.pop()
+    lines = [piece + "\n" for piece in pieces]
+    if last:
+        lines.append(last)
+    return lines
+
+
 def line_ending(line):
     return "\r\n" if line.endswith("\r\n") else "\n"
 
@@ -171,6 +204,8 @@ def read_registry(workspace):
     except scan.NotRegular:
         raise
     except scan.Unverifiable as exc:
+        if str(exc).startswith("could not read registry"):
+            raise
         raise scan.Unverifiable("could not read registry: %s" % exc)
     return snapshot, scan.parse_registry(snapshot.data)
 
@@ -192,8 +227,9 @@ def write_registry(workspace, data, new_text):
     one that waits then finds the file replaced, and refuses. The file is
     opened by the workspace folder's descriptor without following a symlink
     and must be a regular file; under the lock, its name, looked up without
-    following a symlink, must still be that file. The new file takes the mode
-    of the locked file.
+    following a symlink, must still be that file, checked before any temp file
+    is made. The new file takes the mode of the locked file, and its rename
+    rechecks the name's bytes as well (`gen.require_unchanged`).
     """
     try:
         folder = gen.open_folder(workspace, "")
@@ -214,7 +250,7 @@ def write_registry(workspace, data, new_text):
                 raise Refusal(PLAN_CHANGED)
             try:
                 gen.write_atomic(folder, scan.REGISTRY_NAME, new_text.encode("utf-8"),
-                                 (scan.node_of(locked), stat.S_IMODE(locked.st_mode)))
+                                 (scan.node_of(locked), stat.S_IMODE(locked.st_mode), data))
             except gen.TargetChanged:
                 raise Refusal(PLAN_CHANGED)
         finally:
@@ -223,10 +259,19 @@ def write_registry(workspace, data, new_text):
         os.close(folder)
 
 
+def shown(text):
+    """`text` for the terminal: each line, cut on the newline character only, through
+    `edges.printable`, as `scan --edges` prints a path from inside a repository."""
+    pieces = text.split("\n")
+    if pieces[-1] == "":
+        pieces.pop()
+    return "".join(edges.printable(piece) + "\n" for piece in pieces)
+
+
 def emit_plan(out, data, new_text, digest, notes):
     for note in notes:
         out.write(note + "\n")
-    out.write(gen.unified(data.decode("utf-8"), new_text, scan.REGISTRY_NAME))
+    out.write(shown(gen.unified(data.decode("utf-8"), new_text, scan.REGISTRY_NAME)))
     out.write("plan sha256=%s\n" % digest)
 
 

@@ -239,6 +239,31 @@ def test_approved_edge_with_detector_evidence_and_no_signal_is_stale(tmp_path):
     assert "WARN   stale app → beta (runtime) run.sh:3" in out.splitlines(), out
 
 
+@pytest.mark.parametrize("name", ["x\ny.py", "x\u2028y.py", "x\ty.py"])
+def test_raw_evidence_with_a_line_break_goes_stale_when_its_import_is_removed(tmp_path, name):
+    tree = EdgeTree(tmp_path)
+    tree.put(name, "import beta\n")
+    tree.edge("app", "beta", "source", name + ":1")
+    code, out = run_edges(tree)
+    assert code == 0, out
+    assert "WARN   stale" not in out and "prose evidence" not in out, out
+    tree.put(name, "pass\n")
+    code, out = run_edges(tree)
+    assert code == 0, out
+    assert ("WARN   stale app → beta (source) %s:1" % edges.printable(name)
+            in out.splitlines()), repr(out)
+    assert "prose evidence" not in out, out
+
+
+def test_a_name_with_a_space_stays_prose_evidence_as_before(tmp_path):
+    tree = EdgeTree(tmp_path)
+    tree.edge("app", "beta", "source", "my file.py:1")
+    code, out = run_edges(tree)
+    assert "WARN   stale" not in out, out
+    assert ("INFO   1 edges have prose evidence and are not checked for staleness"
+            in out.splitlines()), out
+
+
 def test_approved_edge_with_a_signal_is_not_stale(tmp_path):
     tree = EdgeTree(tmp_path)
     tree.put("run.sh", "source ~/src/beta/lib.sh\n")

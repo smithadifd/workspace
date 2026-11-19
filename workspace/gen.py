@@ -35,14 +35,17 @@ The write path keeps one rule, for `gen`, `register` and `decline` alike:
   umask. New bytes go to a temp file only its owner can read, which takes that
   mode before it is renamed into place.
 - Just before each rename the name is looked up once more, without following
-  a symlink, and must still be the regular file that was read, with the same
-  identity and mode, or still be absent. This look-up only detects a change;
-  the guard is the O_NOFOLLOW open. The window between it and the rename is
-  accepted: a rename replaces the folder entry and never writes through a
-  symlink, and the folder is a held descriptor, so a concurrent writer in that
-  window cannot redirect the write or bring in other bytes. It can only lose
-  its own change to that file, and the recheck at the confirm (here) and the
-  registry lock (`register`) bound that.
+  a symlink, and read once more through an O_NOFOLLOW descriptor: it must
+  still be the regular file that was read, with the same bytes, identity and
+  mode, or still be absent. So an edit in place, which keeps the inode and the
+  mode, is refused too. This recheck only detects a change; the guard is the
+  O_NOFOLLOW open. The byte recheck narrows the window between it and the
+  rename; that window was there before the recheck too, and is accepted: a
+  rename replaces the folder entry and never writes through a symlink, and the
+  folder is a held descriptor, so a concurrent writer in that window cannot
+  redirect the write or bring in other bytes. Only a concurrent edit by the
+  same user can hit it, and it can only lose its own change to that file; the
+  recheck at the confirm (here) and the registry lock (`register`) bound that.
 - Stored text is raw, and each sink encodes it for itself: an edge's evidence
   is stored as the real path, quoted for YAML when written, and escaped for
   the terminal only when printed.
@@ -1087,15 +1090,26 @@ def write_temp(folder, name, data, mode):
 
 
 def require_unchanged(folder, name, expected, rel):
-    """Refuse unless `name` is still the regular file `expected` (node, mode) names, or absent.
+    """Refuse unless `name` is still the file `expected` (node, mode, bytes) names, or absent.
 
     Detection only, just before a rename; the O_NOFOLLOW read is the guard.
+    The name is looked up without following a symlink, then read once more
+    through one O_NOFOLLOW descriptor, so a file edited in place (same inode,
+    same mode) is refused as well as one replaced.
     """
     now = scan.entry_identity(folder, name)
     if expected is None:
         same = now is None
     else:
-        same = now is not None and now[2] and (now[0], now[1]) == tuple(expected)
+        node, mode, data = expected
+        same = now is not None and now[2] and (now[0], now[1]) == (node, mode)
+        if same:
+            try:
+                again = scan.snapshot_at(folder, name, rel)
+            except scan.Unverifiable:
+                again = None
+            same = (again is not None and again.identity == (node, mode)
+                    and again.data == data)
     if not same:
         raise TargetChanged("%s changed since the plan read it" % rel)
 
@@ -1103,8 +1117,9 @@ def require_unchanged(folder, name, expected, rel):
 def write_atomic(folder, name, data, expected, rel=None):
     """Replace `name` in the folder descriptor `folder` atomically.
 
-    `expected` is the (node, mode) of the snapshot it replaces, or None for a
-    new file; the new file takes that mode. Returns the new file's (node, mode).
+    `expected` is the (node, mode, bytes) of the snapshot it replaces, or None
+    for a new file; the new file takes that mode. Returns the new file's
+    (node, mode, bytes).
     """
     temp, identity = write_temp(folder, name, data, None if expected is None else expected[1])
     try:
@@ -1116,11 +1131,12 @@ def write_atomic(folder, name, data, expected, rel=None):
         except OSError:
             pass
         raise
-    return identity
+    return identity + (data,)
 
 
-def identity_of(snapshot):
-    return None if snapshot is None else snapshot.identity
+def expected_of(snapshot):
+    """What `require_unchanged` compares: the snapshot's (node, mode, bytes), or None."""
+    return None if snapshot is None else snapshot.identity + (snapshot.data,)
 
 
 def make_folder(workspace_folder, name, made):
@@ -1156,7 +1172,10 @@ def write_through(workspace, plan, writes, folders, out):
     def undo():
         remove_leftover_temps(workspace)
         for name in reversed(made):
-            os.rmdir(name, dir_fd=folders[""])
+            try:
+                os.rmdir(name, dir_fd=folders[""])
+            except OSError:
+                pass  # it holds a file already written (a pending record): it stays
 
     try:
         folders[""] = open_folder(workspace, "")
@@ -1183,8 +1202,8 @@ def write_through(workspace, plan, writes, folders, out):
         undo()
         out.write("REFUSED  %s changed during the run; %s\n" % (", ".join(changed), PLAN_CHANGED))
         return EX_REFUSED
-    manifest_now = identity_of(plan.manifest_snapshot)
-    state_now = identity_of(plan.state_snapshot)
+    manifest_now = expected_of(plan.manifest_snapshot)
+    state_now = expected_of(plan.state_snapshot)
     try:
         if writes:
             manifest_now = write_atomic(folders[""], MANIFEST_NAME, plan.pending_manifest,
@@ -1193,14 +1212,14 @@ def write_through(workspace, plan, writes, folders, out):
                                      state_now, plan.state_rel)
         for temp, target in temps:
             folder, name = os.path.split(target.rel)
-            require_unchanged(folders[folder], name, identity_of(target.snapshot), target.rel)
+            require_unchanged(folders[folder], name, expected_of(target.snapshot), target.rel)
             os.replace(temp, name, src_dir_fd=folders[folder], dst_dir_fd=folders[folder])
             out.write("wrote  %s\n" % target.rel)
         write_atomic(folders[""], MANIFEST_NAME, plan.manifest_text, manifest_now)
         write_atomic(folders[state_folder], state_name, plan.state_text, state_now,
                      plan.state_rel)
     except OSError as exc:
-        remove_leftover_temps(workspace)
+        undo()
         out.write("UNKNOWN  the write stopped part way: %s; rerun gen to finish it\n" % exc)
         return EX_UNKNOWN
     out.write("recorded %s and %s\n" % (MANIFEST_NAME, plan.state_rel))
