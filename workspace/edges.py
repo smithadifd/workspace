@@ -13,7 +13,10 @@ that starts with `.env` is skipped before any file call, and a folder holding
 
 What cannot be read is a WARN line, never a could-not-verify: the drift
 verdict stands. A symlink or an excluded entry is counted on one INFO line.
-Evidence is a path and a line number, never the line's text.
+Evidence is a path and a line number, never the line's text. A path from
+inside a repository is printed with every backslash and every character
+that is not printable escaped, so a file name cannot start a line of its
+own or send control bytes to the terminal.
 """
 import os
 import re
@@ -56,6 +59,25 @@ UNREAD_LINE = "WARN   could not read %s (%s)"
 NOT_CHECKED_LINE = "INFO   edge %s → %s (%s) not checked: %s"
 PROSE_LINE = "INFO   %d edges have prose evidence and are not checked for staleness"
 PRUNED_LINE = "INFO   edges: %d symlinks not followed, %d excluded entries not entered"
+SHORT_ESCAPES = {"\\": "\\\\", "\n": "\\n", "\r": "\\r", "\t": "\\t"}
+
+
+def printable(text):
+    """`text` with a backslash and every non-printable character escaped, as Python writes them."""
+    shown = []
+    for char in text:
+        code = ord(char)
+        if char in SHORT_ESCAPES:
+            shown.append(SHORT_ESCAPES[char])
+        elif char.isprintable():
+            shown.append(char)
+        elif code < 0x100:
+            shown.append("\\x%02x" % code)
+        elif code < 0x10000:
+            shown.append("\\u%04x" % code)
+        else:
+            shown.append("\\U%08x" % code)
+    return "".join(shown)
 
 
 def name_token(name):
@@ -130,7 +152,7 @@ class EdgeWalk:
         self.excluded = 0
 
     def warn(self, path, reason):
-        self.unread.append(UNREAD_LINE % (path, reason))
+        self.unread.append(UNREAD_LINE % (printable(path), printable(str(reason))))
 
     def list_folder(self, path, info):
         """The names in `path`, listed through a descriptor that is the folder the walk found."""
@@ -208,7 +230,7 @@ class EdgeWalk:
 
 def evidence_text(evidence):
     rel, number = evidence[0]
-    return "%s:%d" % (rel, number)
+    return "%s:%d" % (printable(rel), number)
 
 
 def edge_pairs(document, key):
@@ -286,7 +308,7 @@ def scan_lines(state):
             not_checked.append(NOT_CHECKED_LINE % (origin, target, kind, reason))
             continue
         if (origin, target) not in detected:
-            stale.append(STALE_LINE % (origin, target, kind, evidence))
+            stale.append(STALE_LINE % (origin, target, kind, printable(evidence)))
 
     lines = sorted(candidates) + sorted(stale) + sorted(walker.unread) + sorted(not_checked)
     if prose:

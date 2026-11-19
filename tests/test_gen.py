@@ -9,6 +9,7 @@ import json
 import os
 import random
 import re
+import stat
 import subprocess
 import sys
 import datetime
@@ -755,12 +756,12 @@ class Fault:
         self.name = name
         self.nth = nth
 
-    def __call__(self, src, dst):
+    def __call__(self, src, dst, **kwargs):
         if str(dst).endswith(self.name):
             self.count += 1
             if self.count == self.nth:
                 raise OSError("fault injected")
-        return self.original(src, dst)
+        return self.original(src, dst, **kwargs)
 
 
 def test_crash_after_targets_replaced_does_not_lock_out(tmp_path, monkeypatch):
@@ -838,9 +839,9 @@ def test_a_target_changed_during_the_write_is_not_overwritten(tmp_path, monkeypa
     code, out = run(ws)
     original = gen.write_temp
 
-    def racing(path, data):
-        temp = original(path, data)
-        if str(path).endswith("AGENTS.md"):
+    def racing(folder, name, data):
+        temp = original(folder, name, data)
+        if name == "AGENTS.md":
             ws.write("AGENTS.md", ws.read("AGENTS.md") + "a racing writer's line\n")
         return temp
 
@@ -851,6 +852,115 @@ def test_a_target_changed_during_the_write_is_not_overwritten(tmp_path, monkeypa
     assert "pending" not in ws.read(".workspace-gen.json")
     leftovers = [name for name in contents(ws.path) if name.endswith(gen.TEMP_SUFFIX)]
     assert leftovers == []
+
+
+CREDENTIAL = {"env": {"TOKEN_NAME": "ENV_VALUE_SENTINEL"}, "apiKeyHelper": "HELPER_SENTINEL"}
+
+
+@pytest.fixture
+def umask_022():
+    old = os.umask(0o022)
+    yield
+    os.umask(old)
+
+
+def outside_folder(tmp_path):
+    """A folder outside the workspace, beneath the excluded ~/private, holding settings."""
+    outside = tmp_path / "private" / "elsewhere"
+    outside.mkdir(parents=True)
+    (outside / "settings.json").write_text(json.dumps(CREDENTIAL), encoding="utf-8")
+    return outside
+
+
+@pytest.mark.parametrize("folder", [".claude", "state"])
+def test_symlinked_output_folder_is_refused_before_it_is_read(tmp_path, monkeypatch, folder):
+    ws = WS(tmp_path, monkeypatch)
+    os.symlink(outside_folder(tmp_path), ws.path / folder)
+    before = contents(tmp_path)
+    for expect in (None, "0" * 64):
+        code, out = run(ws, expect=expect)
+        refused(code, out, gen.OUTPUT_LINK % folder)
+        assert "SENTINEL" not in out, out
+    assert contents(tmp_path) == before
+
+
+@pytest.mark.parametrize("folder", [".claude", "state"])
+def test_output_folder_swapped_for_a_symlink_after_the_plan_is_not_written_through(
+        tmp_path, monkeypatch, folder):
+    ws = WS(tmp_path, monkeypatch)
+    plan = gen.make_plan(str(ws.path), HOST, False)
+    outside = outside_folder(tmp_path)
+    # A file outside named like a gen temp: cleanup after the refusal must not reach it.
+    (outside / (".settings.json" + gen.TEMP_SUFFIX)).write_text("theirs\n", encoding="utf-8")
+    os.symlink(outside, ws.path / folder)
+    before = contents(outside)
+    buffer = io.StringIO()
+    code = gen.write_plan(str(ws.path), plan, buffer)
+    assert code == 1, buffer.getvalue()
+    assert "REFUSED  could not write: " in buffer.getvalue(), buffer.getvalue()
+    assert contents(outside) == before
+    assert sorted(os.listdir(ws.path)) == sorted(["registry.yaml", folder])
+
+
+def test_reads_below_the_workspace_never_follow_a_symlinked_folder(tmp_path, monkeypatch):
+    ws = WS(tmp_path, monkeypatch)
+    os.symlink(outside_folder(tmp_path), ws.path / ".claude")
+    with pytest.raises(scan.Unverifiable, match="could not read .claude/settings.json: "):
+        gen.read_bytes(str(ws.path), gen.SETTINGS_REL)
+
+
+def test_first_run_refusal_shows_only_gen_owned_settings(tmp_path, monkeypatch):
+    ws = WS(tmp_path, monkeypatch)
+    ws.write(".claude/settings.json",
+             json.dumps(dict(CREDENTIAL, permissions={"deny": []}), indent=2))
+    before = contents(ws.path)
+    code, out = run(ws)
+    refused(code, out, ".claude/settings.json exists and gen has no record of writing it")
+    assert "(gen-owned entries only)" in out, out
+    assert "+  deny: Read(~/private/**)" in out, out
+    for secret in ("SENTINEL", "TOKEN_NAME", "apiKeyHelper", '"env"'):
+        assert secret not in out, out
+    assert contents(ws.path) == before
+
+
+@pytest.mark.parametrize("mode", [0o600, 0o640, 0o644])
+def test_rewritten_settings_keep_their_mode(tmp_path, monkeypatch, umask_022, mode):
+    ws = WS(tmp_path, monkeypatch)
+    ws.write(".claude/settings.json", json.dumps(CREDENTIAL))
+    ws.file(".claude/settings.json").chmod(mode)
+    written = generate(ws, "--adopt")
+    assert "wrote  .claude/settings.json" in written, written
+    assert "Read(~/private/**)" in ws.read(".claude/settings.json")
+    assert stat.S_IMODE(ws.file(".claude/settings.json").stat().st_mode) == mode
+
+
+def test_a_replacing_temp_is_created_owner_only(tmp_path, monkeypatch, umask_022):
+    ws = WS(tmp_path, monkeypatch)
+    ws.write(".claude/settings.json", json.dumps(CREDENTIAL))
+    ws.file(".claude/settings.json").chmod(0o644)
+    code, out = run(ws, "--adopt")
+    created = {}
+    original = os.open
+
+    def spying(path, flags, mode=0o777, **kwargs):
+        if str(path).endswith(gen.TEMP_SUFFIX):
+            created[str(path)] = mode
+        return original(path, flags, mode, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(gen.os, "open", spying)
+        code, written = run(ws, "--adopt", expect=plan_hash(out))
+    assert code == 0, written
+    assert created[".settings.json" + gen.TEMP_SUFFIX] == 0o600, created
+    assert created[".AGENTS.md" + gen.TEMP_SUFFIX] == 0o666, created
+
+
+def test_new_files_get_the_usual_mode(tmp_path, monkeypatch, umask_022):
+    ws = WS(tmp_path, monkeypatch)
+    generate(ws)
+    for rel in ("AGENTS.md", "CLAUDE.md", ".claude/settings.json", "desk.code-workspace",
+                ".workspace-gen.json", "state/gen-desk.json"):
+        assert stat.S_IMODE(ws.file(rel).stat().st_mode) == 0o644, rel
 
 
 def test_deleted_editor_file_is_rewritten(tmp_path, monkeypatch):

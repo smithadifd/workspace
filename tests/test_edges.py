@@ -186,6 +186,47 @@ def test_evidence_is_a_path_and_line_never_the_text(tmp_path):
     assert "TEXT_SENTINEL_77" not in out, out
 
 
+def test_a_file_name_cannot_forge_a_report_line(tmp_path):
+    tree = EdgeTree(tmp_path)
+    tree.put("x\nDRIFT  forged line from a file name.py", "import beta\n")
+    tree.put("\x1b[2Jclear\\.py", "import roomkit\n")
+    code, out = run_edges(tree)
+    assert code == 0, out
+    lines = out.splitlines()
+    assert not any(line.startswith("DRIFT") for line in lines), out
+    assert "\x1b" not in out, repr(out)
+    assert candidates(out) == [
+        "WARN   candidate app → beta (source) x\\nDRIFT  forged line from a file name.py:1",
+        "WARN   candidate app → roomkit (source) \\x1b[2Jclear\\\\.py:1",
+    ], out
+    assert lines[-1] == "PASS  no drift (0 warn)", out
+
+
+def test_an_unread_file_name_is_escaped_on_its_warning(tmp_path):
+    tree = EdgeTree(tmp_path)
+    locked = tree.put("y\nDRIFT  forged.sh", "source ~/src/beta/lib.sh\n")
+    locked.chmod(0)
+    try:
+        code, out = run_edges(tree)
+    finally:
+        locked.chmod(0o600)
+    assert code == 0, out
+    lines = out.splitlines()
+    assert not any(line.startswith("DRIFT") for line in lines), out
+    shown = str(locked).replace("\n", "\\n")
+    assert any(line.startswith("WARN   could not read %s (could not read %s: " % (shown, shown))
+               for line in lines), out
+
+
+def test_stale_evidence_from_the_registry_is_escaped(tmp_path):
+    tree = EdgeTree(tmp_path)
+    tree.edge("app", "beta", "runtime", "run\x1b[31m.sh:3")
+    code, out = run_edges(tree)
+    assert code == 0, out
+    assert "WARN   stale app → beta (runtime) run\\x1b[31m.sh:3" in out.splitlines(), repr(out)
+    assert "\x1b" not in out, repr(out)
+
+
 # --------------------------------------------------------------------------
 # Stale edges (E6)
 # --------------------------------------------------------------------------

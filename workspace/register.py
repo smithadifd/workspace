@@ -22,6 +22,7 @@ Exit codes: 0 planned or written, 1 refused, 2 could not verify.
 """
 import copy
 import datetime
+import fcntl
 import json
 import os
 import re
@@ -165,12 +166,40 @@ def read_registry_text(workspace):
     return data
 
 
+def read_handle(handle):
+    chunks = []
+    while True:
+        chunk = os.read(handle, scan.READ_CHUNK)
+        if not chunk:
+            return b"".join(chunks)
+        chunks.append(chunk)
+
+
 def write_registry(workspace, data, new_text):
-    """Replace registry.yaml atomically, only while it still holds the bytes the plan read."""
+    """Replace registry.yaml atomically, only while it still holds the bytes the plan read.
+
+    The comparison and the replacement run under an exclusive lock on the
+    registry file, so two confirmed writes never both pass the comparison: the
+    one that waits then finds the file replaced, and refuses.
+    """
     path = os.path.join(workspace, scan.REGISTRY_NAME)
-    if read_registry_text(workspace) != data:
-        raise Refusal(PLAN_CHANGED)
-    gen.write_atomic(path, new_text.encode("utf-8"))
+    try:
+        handle = os.open(path, os.O_RDONLY | getattr(os, "O_CLOEXEC", 0))
+    except OSError as exc:
+        raise scan.Unverifiable("could not read registry: %s" % exc)
+    try:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        try:
+            now = os.stat(path)
+        except FileNotFoundError:
+            raise Refusal(PLAN_CHANGED)
+        if scan.node_of(os.fstat(handle)) != scan.node_of(now):
+            raise Refusal(PLAN_CHANGED)
+        if read_handle(handle) != data:
+            raise Refusal(PLAN_CHANGED)
+        gen.write_atomic(path, new_text.encode("utf-8"))
+    finally:
+        os.close(handle)
 
 
 def emit_plan(out, data, new_text, digest, notes):

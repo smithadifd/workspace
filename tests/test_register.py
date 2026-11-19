@@ -9,17 +9,20 @@ dir, so `~/src` is the code root:
     ws/registry.yaml             written as text, with comments, so splices are byte-checked
 """
 import datetime
+import fcntl
 import io
 import os
 import re
+import stat
 import subprocess
 import sys
+import threading
 from pathlib import Path
 
 import pytest
 import yaml
 
-from workspace import check, register, scan
+from workspace import check, gen, register, scan
 from test_scan import REPO_ROOT, Trace, fold_case, git, make_repo, reaches
 
 TODAY = datetime.date(2026, 11, 18)
@@ -765,3 +768,67 @@ def test_decline_writes_only_the_registry(tmp_path, monkeypatch):
     assert "run: workspace gen %s" % reg.ws in written, written
     assert sorted(os.listdir(reg.ws)) == ["AGENTS.md", "registry.yaml"]
     assert (reg.ws / "AGENTS.md").read_text(encoding="utf-8") == "map\n"
+
+
+def test_concurrent_confirmed_writes_never_lose_an_addition(tmp_path, monkeypatch):
+    reg = Reg(tmp_path, monkeypatch)
+    patterns = {"A": "https://example.invalid/first/*", "B": "https://example.invalid/second/*"}
+    digests = {}
+    for name, pattern in patterns.items():
+        code, out = run_decline(reg, pattern)
+        assert code == 0, out
+        digests[name] = plan_hash(out)
+    b_may_run = threading.Event()
+    b_at_lock = threading.Event()
+    real_flock = fcntl.flock
+    real_write = gen.write_atomic
+
+    def flock(handle, operation):
+        if threading.current_thread().name == "B":
+            b_at_lock.set()
+        return real_flock(handle, operation)
+
+    def write_atomic(path, data):
+        if threading.current_thread().name == "A":
+            # A has compared the registry bytes. B runs up to its lock (or, with
+            # no lock, to its end) before A replaces the file.
+            b_may_run.set()
+            assert b_at_lock.wait(10)
+        return real_write(path, data)
+
+    results = {}
+
+    def confirm(name):
+        if name == "B":
+            b_may_run.wait(10)
+        try:
+            results[name] = run_decline(reg, patterns[name], expect=digests[name])
+        finally:
+            b_at_lock.set()
+
+    monkeypatch.setattr(register.fcntl, "flock", flock)
+    monkeypatch.setattr(register.gen, "write_atomic", write_atomic)
+    threads = [threading.Thread(target=confirm, args=(name,), name=name) for name in "AB"]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(30)
+    declined = [entry["remote"] for entry in load(reg)["declined"]]
+    for name in "AB":
+        code, out = results[name]
+        if code == 0:
+            assert patterns[name] in declined, "%s reported success but its entry is lost:\n%s" % (
+                name, reg.text())
+    assert results["A"][0] == 0, results["A"][1]
+    refused(*results["B"], register.PLAN_CHANGED)
+
+
+def test_a_written_registry_keeps_its_mode(tmp_path, monkeypatch):
+    reg = Reg(tmp_path, monkeypatch)
+    (reg.ws / "registry.yaml").chmod(0o600)
+    old = os.umask(0o022)
+    try:
+        declined_with(reg, "~/src/tmp-*")
+    finally:
+        os.umask(old)
+    assert stat.S_IMODE((reg.ws / "registry.yaml").stat().st_mode) == 0o600
