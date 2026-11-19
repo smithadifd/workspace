@@ -19,6 +19,9 @@ Without `--write` it prints the plan and a plan hash and writes nothing. With
 `--write --expect HASH` it recomputes the plan and writes it only when the hash
 matches. Every refusal is decided before the first write, and what it writes
 always passes `check`: it runs `check` on the rendered map and settings first.
+A project folder, on any host, that is, holds or sits inside an excluded
+folder under any spelling is refused before any output file is
+read (`overlap_gate`, the rule in `workspace.overlap`, which `check` runs too).
 It runs no other program and opens no network connection.
 
 The write path keeps one rule, for `gen`, `register` and `decline` alike:
@@ -65,7 +68,7 @@ import re
 import stat
 import sys
 
-from workspace import check, scan
+from workspace import check, overlap, scan
 
 EX_DONE = 0
 EX_REFUSED = 1
@@ -356,6 +359,17 @@ def path_gate(document, exclusions):
             if scan.is_excluded(path, exclusions):
                 reasons.append("project `%s` path %s (host `%s`) is under an excluded path"
                                % (project["name"], text, host))
+    if reasons:
+        raise Refusal(*reasons)
+
+
+def overlap_gate(document):
+    """Refuse a project folder, on any host, that reaches an excluded folder by identity.
+
+    `overlap.excluded_overlaps` holds the rule; `check` runs it too, so what gen
+    writes passes `check`. A step it cannot stat is a could-not-verify.
+    """
+    reasons = overlap.excluded_overlaps(document)
     if reasons:
         raise Refusal(*reasons)
 
@@ -867,13 +881,9 @@ def render_code_workspace(document, host):
     for project in document.get("projects") or []:
         if project.get("lifecycle") == "archived":
             continue
-        text = (project.get("paths") or {}).get(host)
-        if text is None:
+        path = overlap.project_folder(project, host)
+        if path is None:
             continue
-        path = scan.expand_path(text, "project `%s` path" % project["name"])
-        subpath = project.get("subpath")
-        if isinstance(subpath, str) and subpath:
-            path = os.path.normpath(os.path.join(path, subpath))
         folders.append({"name": project["name"], "path": path})
     return json.dumps({"folders": folders, "settings": {}}, indent=2, ensure_ascii=False) + "\n"
 
@@ -1016,6 +1026,7 @@ def make_plan(workspace, host_flag, adopt):
     clusters = map_gate(document, code_roots)
     exclusions = [scan.exclusion_pattern(path) for path in excluded]
     path_gate(document, exclusions)
+    overlap_gate(document)
     literal_gate(excluded)
     output_folder_gate(workspace)
 

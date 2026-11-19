@@ -9,8 +9,13 @@ prove:
 3. every excluded path is in permissions.deny (a Read and an Edit rule), and in
    sandbox.filesystem.denyRead when the settings declare a `sandbox` block
 4. duplicate YAML keys are rejected; an unhashable mapping key is UNKNOWN
+5. no project folder that is not archived, on any host, is, holds or sits
+   inside an excluded folder under any spelling (`workspace.overlap`); a
+   step it cannot stat is UNKNOWN
 
-Opens the three inputs for reading only. No network. No writes.
+Opens the three inputs for reading only; to judge rule 5 it looks up (stats)
+each project folder and excluded folder, and the folders above them, and
+opens nothing there. No network. No writes.
 
 Exit codes:
   0  CONFORMS
@@ -22,6 +27,8 @@ from pathlib import Path
 import json
 import re
 import sys
+
+from workspace import overlap, scan
 
 try:
     import yaml
@@ -313,6 +320,7 @@ def check(document, map_text, settings):
             gaps.append("excluded entry is missing path")
             continue
         record_exclusion_gaps(gaps, path, deny_rules, deny_read, sandbox_declared)
+    gaps.extend(overlap.excluded_overlaps(document))
     return gaps
 
 
@@ -377,7 +385,10 @@ def main(workspace_arg):
     if not isinstance(settings, dict):
         unknown("settings root is not an object")
 
-    gaps = check(document, map_text, settings)
+    try:
+        gaps = check(document, map_text, settings)
+    except scan.Unverifiable as exc:
+        unknown(str(exc))
     if gaps:
         for gap in gaps:
             sys.stdout.write("GAP   %s\n" % gap)
