@@ -1,0 +1,10 @@
+== workspace scan ==
+host `testhost`, code root <BASE>/code
+SKIP   <BASE>/code/secret: excluded path, not read
+INFO   worktree <BASE>/code/alpha-wt folds into <BASE>/code/alpha
+INFO   worktree <BASE>/code/beta-wt folds into <BASE>/code/beta
+DRIFT  unregistered repo at <BASE>/code/beta (example.invalid/acme/beta)
+INFO   declined repo at <BASE>/code/gamma (example.invalid/acme/gamma)
+WARN   project `delta` is missing on host `testhost`: <BASE>/code/delta
+KNOWN  archived project `legacy` is present at <BASE>/code/legacy
+== result: 1 drift, 1 warn ==

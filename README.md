@@ -2,11 +2,13 @@
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-Read-only checks for a workspace: one folder you launch a coding agent from when
-work spans several repositories. The workspace holds a registry of your projects,
-a short map an agent reads to get its bearings, and the agent settings that keep
-it out of folders it must not touch. One command, `workspace`, checks that the
-three agree and that the repositories on disk match the registry.
+Checks, and a generator that writes only on a confirm, for a workspace: one
+folder you launch a coding agent from when work spans several repositories. The
+workspace holds a registry of your projects, a short map an agent reads to get
+its bearings, and the agent settings that keep it out of folders it must not
+touch. One command, `workspace`, checks that the three agree and that the
+repositories on disk match the registry, and renders the map and the settings
+from the registry when you confirm the plan it shows.
 
 ## Why
 
@@ -26,7 +28,9 @@ gets read access it should not have. `workspace` makes those gaps visible.
 
 ## What this is
 
-One Python package and one command with two verbs, both read-only:
+One Python package and one command with five verbs. `check` and `scan` only
+read; `gen`, `register` and `decline` print a plan and a plan hash, and write
+only when you run them again with `--write --expect <hash>`:
 
 - `workspace check WORKSPACE` proves that the registry, the map and
   `.claude/settings.json` agree: every active project has its own map line,
@@ -38,6 +42,18 @@ One Python package and one command with two verbs, both read-only:
   reports what the registry does not account for: repositories it does not name
   and has not declined, registered repositories missing on this host, and
   archived repositories still on disk.
+- `workspace scan WORKSPACE --edges` also proposes edges between registered
+  repositories from their source files, and names approved edges whose evidence
+  is gone.
+- `workspace gen WORKSPACE` renders the map (`AGENTS.md`), the `CLAUDE.md`
+  pointer, the code roots and deny rules in `.claude/settings.json`, and this
+  host's `.code-workspace` file from the registry. What it writes always passes
+  `check`.
+- `workspace register WORKSPACE PATH --cluster ID --one-liner TEXT` adds the
+  repository at PATH to the registry, with the edges found between it and the
+  registered repositories.
+- `workspace decline WORKSPACE PATTERN --reason TEXT` records a remote or path
+  pattern the registry should not propose again.
 
 It needs Python 3.11 or newer and PyYAML, its one dependency. It does not
 depend on any agent runtime: the registry and the map are plain files, and any
@@ -52,8 +68,11 @@ A workspace folder holds three files:
 | File | What it is |
 |------|------------|
 | `registry.yaml` | The machine-readable list: code roots per host, excluded paths, clusters, projects (identity is the git remote; paths are recorded per host), edges between projects, and the repositories and edges you declined. |
-| `AGENTS.md` | The map an agent reads: one line per project and one per edge. `CLAUDE.md` is a one-line shim (`@AGENTS.md`) so Claude Code loads the same map. A workspace whose hand-kept map is still in `CLAUDE.md` works too: `check` reads `AGENTS.md` when it exists and `CLAUDE.md` otherwise. |
+| `AGENTS.md` | The map an agent reads: one line per project, with the projects it uses (its outgoing edges) as `uses:` on that line. `CLAUDE.md` is a one-line shim (`@AGENTS.md`) so Claude Code loads the same map. A workspace whose hand-kept map is still in `CLAUDE.md` works too: `check` reads `AGENTS.md` when it exists and `CLAUDE.md` otherwise. |
 | `.claude/settings.json` | Claude Code's settings: the code roots as additional directories, and a Read and an Edit deny rule for every excluded path. |
+
+To start a workspace, copy [`docs/template/registry.yaml`](docs/template/registry.yaml),
+fill it in, and run `workspace gen` (see [`docs/template/README.md`](docs/template/README.md)).
 
 The design rests on a few decisions, in plain words:
 
@@ -64,21 +83,34 @@ The design rests on a few decisions, in plain words:
   Identity is the git remote, worktrees fold into their parent, and a project
   may be a folder inside a larger repository.
 - Discovery is automatic and only proposes. `scan` reports; it never registers,
-  declines or edits anything.
+  declines or edits anything. `register` and `decline` change `registry.yaml`
+  only on a confirm, and only `gen` writes the map.
 - The map stays lazy: one line per project, and a project's own instructions
   are read only when the work touches it.
-
-Later verbs (`gen` to render the map and settings from the registry,
-`register` and `decline`) are planned and are not in this release.
 
 ## What it does on your machine
 
 `scan` gives a verdict only for a repository in the plain shape it can read safely: a `.git` folder, or a worktree whose `.git` file names `<repo>/.git/worktrees/<name>` for a repository found directly in the code root or registered, reached from the code root without a symlink, with a single plain `config` file that has no include section and does not turn on per-worktree config. Anything else it meets (a symlink, an odd git folder layout, an include, per-worktree config, an excluded entry reached by another name, a file that changes while it is read) ends the scan with exit 2 and names the reason. It never reads beneath an excluded path, outside the code root, or inside a repository beyond its git files, and `git` only ever parses config bytes handed to it on standard input.
 
+The paragraph above is the promise of `scan`. `scan --edges` keeps it with two differences, both only inside registered repositories that are not archived. First, it also lists and reads source files there, walking each step from the repository the same way, judged by text and by identity against every excluded entry, never through a symlink, never into a nested repository, and never opening a file whose name starts with `.env`. Second, what it meets there does not end the scan with exit 2: a symlink or an excluded entry reached by another name is not followed or entered and is counted on one `INFO` line, and a file or folder that cannot be read safely, including one that changes while it is read, is not read and is named on a `WARN` line. Every repository-shape check, and everything outside those repositories, still ends the scan with exit 2 as above. It prints a candidate edge as a file path and line number, never the line. `gen`, `register` and `decline` print a plan and a plan hash and write nothing; run again with `--write --expect <hash>` to write exactly that plan. `gen` writes the map, the `CLAUDE.md` pointer, `.claude/settings.json` (only the code roots and the deny rules for excluded paths, never a `sandbox` block), the per-host `.code-workspace` file and its own manifest, and what it writes always passes `check`. `register` and `decline` change only `registry.yaml`. Nothing here opens a network connection.
+
 **What it reads.**
 
 - The workspace folder's `registry.yaml`, its map (`AGENTS.md`, or `CLAUDE.md`)
-  and `.claude/settings.json`. `scan` reads only `registry.yaml`.
+  and `.claude/settings.json`. `scan` reads only `registry.yaml`. `gen` reads
+  `registry.yaml`, the map, `.claude/settings.json`, its manifest
+  `.workspace-gen.json`, this host's `state/gen-<host>.json` and
+  `<host>.code-workspace`; it never reads a repository, and it looks up (never
+  opens) each excluded entry whose text holds a glob character.
+- `register` reads the repository at PATH the way `scan` reads a repository:
+  PATH is walked from the code root one step at a time and refused, before
+  anything under it is touched, when a step is excluded, outside the code root,
+  inside a registered repository, a symlink or missing; it then lists the code
+  root and walks every registered path as `scan` does, and reads the
+  repository's git files with the same reader. To draft edges it also reads
+  source files inside PATH's repository and inside every registered, present,
+  non-archived repository, exactly as `scan --edges` does.
+- `decline` reads only `registry.yaml`.
 - Which host it is on: the `code_roots` key that `--host` names. Without
   `--host`, `scan` uses the registry's only host when `code_roots` names exactly
   one; when it names several, `scan` exits 2 and names them. It never guesses
@@ -130,11 +162,15 @@ Later verbs (`gen` to render the map and settings from the registry,
   written as a bare folder, as `folder/*` or as `folder/**` covers that folder
   and everything beneath it. That is where you list agent scratch folders,
   worktree copies, and folders that hold live personal data, such as a rooms
-  folder.
+  folder (`~/rooms`).
 - Anything outside the code root, through a symlink or otherwise.
-- The contents of a repository. Nothing inside a repository is listed or opened
-  apart from its `.git` marker and the git files above, so `.env` files and
-  other secrets in a repository are never read.
+- Without `--edges`, the contents of a repository: `scan` lists or opens
+  nothing inside a repository apart from its `.git` marker and the git files
+  above, so `.env` files and other secrets in a repository are never read.
+  `scan --edges` and `register` do read source files inside repositories, as
+  described above; they never open a file whose name starts with `.env` (the
+  name is judged before any file call), and they print evidence as a path and
+  a line number, never the line.
 
 An excluded path is recognised two ways. By its text, after `~` expands to your
 home folder: a path is checked against the excluded list before any file call
@@ -153,8 +189,37 @@ no symlinked folder above it: `git` records a worktree's git folder by its real
 path, and a worktree whose git folder does not sit under the code root as
 written ends the scan with exit 2.
 
-**What it writes.** Nothing. `check` and `scan` only read, and neither opens a
-network connection.
+**What it writes.** `check` and `scan` write nothing. `gen` writes, in the
+workspace folder, `AGENTS.md`, `CLAUDE.md` (exactly `@AGENTS.md`),
+`.claude/settings.json`, `<host>.code-workspace`, its manifest
+`.workspace-gen.json` and `state/gen-<host>.json`. `register` and `decline`
+write only `registry.yaml`, adding text and keeping every other byte, comments
+included. Each writes only on `--write --expect <hash>`, and only the plan
+whose hash that is: a plan that changed since you saw it is refused. Every
+refusal is decided before the first write, and each file is replaced whole
+(written beside it, then renamed). None of the verbs opens a network
+connection or runs any program other than `git` reading config bytes.
+
+In `.claude/settings.json`, `gen` owns only the code roots in
+`permissions.additionalDirectories`, a Read and an Edit deny rule for each
+excluded path, and, when you have declared a `sandbox` block yourself, each
+excluded path in `sandbox.filesystem.denyRead`. It never writes a `sandbox`
+block, and every other key and rule passes through. It removes only rules its
+manifest records it owning, once their path leaves the registry. Another agent
+reads `AGENTS.md` but does not get these deny rules: only Claude Code enforces
+them.
+
+Keep your own text in the map inside the two keep blocks, `<!-- workspace:keep
+begin top -->` … `<!-- workspace:keep end top -->` and the same with `bottom`;
+`gen` copies them byte for byte and rewrites everything else. A file `gen` did
+not write is replaced only with `--adopt`, and a hand-kept map only when it
+holds keep markers. A file changed outside `gen` since it last wrote it is
+refused, `--adopt` or not.
+
+Commit `registry.yaml`, the map, `CLAUDE.md`, `.claude/settings.json` and
+`.workspace-gen.json`. The editor file and the per-host state hold this
+machine's absolute paths: add `*.code-workspace` and `state/` to the
+workspace's `.gitignore`.
 
 ## Known limits
 
@@ -162,10 +227,27 @@ These are not covered:
 
 - A concurrent writer that swaps an intermediate step of a path between its
   check and the next step's check. The last step is covered: the file is
-  opened without following a symlink and must be the file the walk found.
+  opened without following a symlink and must be the file the walk found. With
+  `--edges`, and in `register`, this holds inside repositories too; a folder is
+  listed only when it is still the folder the walk found.
 - An entry matched only by a glob other than a trailing `/*` or `/**`, not by
   the exclusion's literal text, is matched by its text only, so another letter
-  case of it is not recognised.
+  case of it is not recognised. This holds inside repositories too, for
+  `scan --edges` and `register`: an exclusion such as `~/src/app/priv-*` prunes
+  `priv-notes` by its text, not by its identity.
+- Edge detectors are name heuristics: a candidate can be wrong, and a real
+  dependency can be missed.
+- An approved edge whose evidence is prose, rather than `path:LINE`, is never
+  checked for staleness; such edges are counted on one `INFO` line.
+- A source file with more than one hard link, or larger than 400,000 bytes, is
+  not read for edges.
+- `gen`'s check that the map imports nothing inside a registered repository
+  compares paths by their text, so an `@` import through a symlinked folder into
+  a registered repository is not recognised.
+- An excluded entry whose real name holds a `[` glob class (such as `[priv]`)
+  cannot be denied by a Claude Code rule that matches its literal name; `gen`
+  refuses such a workspace with exit 2 and names the entry, and an entry
+  created with such a name after `gen` ran is not denied.
 - Each excluded entry that exists is looked up, including entries outside the
   code root, to learn its identity. It is never opened.
 - A rewrite of a file that keeps its inode and size is caught only by its
@@ -206,6 +288,11 @@ From a clone with PyYAML available, `python3 -m workspace <verb>` is the same as
 workspace check ~/workspaces/main
 workspace scan ~/workspaces/main
 workspace scan ~/workspaces/main --host desk
+workspace scan ~/workspaces/main --edges
+workspace gen ~/workspaces/main                       # prints the plan and its hash
+workspace gen ~/workspaces/main --write --expect HASH # writes exactly that plan
+workspace register ~/workspaces/main ~/src/new-tool --cluster tools --one-liner "Builds things."
+workspace decline ~/workspaces/main 'https://example.invalid/acme/scratch-*' --reason "throwaway"
 ```
 
 `check` prints one `GAP` line per inconsistency, or a `PASS` line:
@@ -232,6 +319,26 @@ prints one line per finding:
 | `INFO   worktree PATH folds into PARENT` | A worktree, counted as its parent repository. |
 | `SKIP   PATH: REASON` | An excluded entry in the code root, never entered. |
 
+With `--edges`, `scan` adds these lines after the ones above and before the
+summary. Edge `WARN` lines never change the exit code and are not counted in
+the summary's `warn` figure:
+
+| Line | Meaning |
+|------|---------|
+| `WARN   candidate FROM → TO (KIND) PATH:LINE` | A build, source or runtime signal in FROM's files naming TO, with no approved and no rejected edge for the pair. PATH is relative to FROM's folder. |
+| `WARN   stale FROM → TO (KIND) EVIDENCE` | An approved edge whose `path:LINE` evidence no detector finds any more. |
+| `WARN   could not read PATH (REASON)` | A file or folder inside a repository that could not be read safely; it was not read. |
+| `INFO   edge FROM → TO (KIND) not checked: REASON` | An approved edge whose FROM repository is not on this host, or is archived. |
+| `INFO   N edges have prose evidence and are not checked for staleness` | Approved edges whose evidence is prose. |
+| `INFO   edges: N symlinks not followed, M excluded entries not entered` | What the edge pass pruned, so nothing is skipped silently. |
+
+`gen`, `register` and `decline` print the plan (a diff per file; for
+`.claude/settings.json`, only the entries `gen` owns), then
+`plan sha256=<hash>`. `register` also prints a `NOTE   look-alike:` line for a
+project with the same folder name, a `-`/`_` variant or a near spelling,
+suggesting `confused_with`. After `register --write` or `decline --write`, run
+`workspace gen` to update the map.
+
 A repository counts as registered when its remote matches a project's `remote`
 (after normalising `https://`, `ssh://` and `user@host:` forms and a trailing
 `.git`) or its folder is a project's path for this host. A `declined` entry's
@@ -240,12 +347,22 @@ with `/` or `~` is a path glob matched against the repository's folder.
 
 ### Exit codes
 
-| Code | `check` | `scan` |
-|------|---------|--------|
-| 0 | consistent | no drift (`WARN` lines may be present) |
-| 1 | at least one `GAP` | at least one `DRIFT` |
-| 2 | could not verify | could not verify |
-| 3 | usage error | usage error |
+| Code | `check` | `scan` | `gen`, `register`, `decline` |
+|------|---------|--------|------------------------------|
+| 0 | consistent | no drift (`WARN` lines may be present) | plan printed, or written |
+| 1 | at least one `GAP` | at least one `DRIFT` | refused (`REFUSED` and the reason); nothing written |
+| 2 | could not verify | could not verify | could not verify; nothing written |
+| 3 | usage error | usage error | usage error |
+
+`gen`, `register` and `decline` read the registry as `scan` does, so a registry
+`scan` cannot read (a repeated key, a field outside the grammar), a host missing
+from `code_roots`, or a code root `scan` cannot verify is exit 2 for them too;
+so is a repository `register` cannot identify (no `.git`, no origin remote, an
+include or per-worktree config). A refused PATH, a registry the map cannot
+carry, output that would fail `check`, a file changed outside `gen`, or a plan
+hash that no longer matches is exit 1. A `gen --write` that stops part way
+(for example, a full disk) is exit 2; every file then holds its old content or
+the planned one, and the next `gen` finishes it.
 
 Exit 2 always prints `UNKNOWN` and the reason, and it is never a pass. `scan`
 exits 2 on a registry it cannot read or parse, a field outside the registry's
@@ -276,7 +393,11 @@ declined repository, an archived one on disk, a missing one, a symlink out of
 the root and an excluded folder, and record every path the scan hands to a file
 call, and every `git` run, to prove it never touches anything beneath the
 excluded folder (by text and by identity), the outside of the root, or the
-inside of a repository, and that `git` is never handed a path.
+inside of a repository, and that `git` is never handed a path. The `gen`
+tests run `check` on what `gen` writes for 200 generated registries and every
+excluded-path form, and inject a crash at each step of a write; the edge and
+`register` tests record every file call the same way, to prove that nothing
+beneath an excluded entry, through a symlink or named `.env*` is touched.
 
 ```sh
 python3 -m pytest -q
