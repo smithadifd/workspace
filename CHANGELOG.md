@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.1](https://github.com/smithadifd/workspace/compare/v0.1.0...v0.1.1) (2026-11-19)
+
+
+### Bug Fixes
+
+* **gen:** refuse a project path that reaches an excluded folder ([#6](https://github.com/smithadifd/workspace/issues/6)) ([d10a1db](https://github.com/smithadifd/workspace/commit/d10a1db5da066c163733b2bf671ca76413b7f556))
+
 ## 0.1.0 (2026-11-19)
 
 The first version: one command, `workspace`, with two read-only verbs and three that write only on a confirm.
