@@ -20,6 +20,7 @@ import time
 import pytest
 import yaml
 
+from test_gen import generate
 from test_scan import REPO_ROOT
 from workspace import prompt
 
@@ -583,3 +584,40 @@ def test_cli_dispatches_prompt(tmp_path, monkeypatch, capsys):
     assert captured.err == ""
     assert captured.out == (
         "1 unregistered repo (newest: stray). Say 'register stray' or 'decline stray'\n")
+
+
+# --------------------------------------------------------------------------
+# One opt-in rule: gen and prompt call scan.session_prompt
+# --------------------------------------------------------------------------
+
+def gen_adds_the_hook(ws):
+    generate(ws)
+    settings = json.loads((ws.path / ".claude" / "settings.json").read_text(encoding="utf-8"))
+    entries = settings.get("hooks", {}).get("SessionStart", [])
+    return any(hook.get("command") == "workspace prompt"
+               for entry in entries for hook in entry["hooks"])
+
+
+@pytest.mark.parametrize("opt_in, on", [
+    ("on", True),
+    ("'on'", True),
+    ("On", False),
+    ("true", False),
+    ("yes", False),
+    (None, False),
+    ("garbage", False),
+])
+def test_gen_and_prompt_agree_on_whether_the_opt_in_is_on(tmp_path, monkeypatch, opt_in, on):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    ws = WS(tmp_path, opt_in=opt_in)
+    ws.repo("stray")
+    out = kept_contract(run_prompt(ws))
+    prompt_on = out != ""
+    hook_on = gen_adds_the_hook(ws)
+    assert prompt_on == hook_on == on, (opt_in, out)
+
+
+def test_readme_documents_the_snooze_and_what_the_state_records():
+    readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+    assert "`workspace prompt --snooze DAYS` (1 to 365)" in readme
+    assert "records the day of the last finished scan" in readme

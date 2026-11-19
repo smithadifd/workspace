@@ -27,8 +27,9 @@ Invariants (the bar this verb is built to):
 3. Quiet on failure. The line prints only after its state write lands; a
    failed write prints nothing.
 4. Opt-in. The opt-in is the registry's top-level `session_prompt: on`; an
-   absent key, or any other value, is off. Off reads no state, runs no scan
-   and writes nothing. (`gen` owns the hook entry: one manifest-owned
+   absent key, or any other value, is off. `prompt` reads it only through
+   `scan.session_prompt`, the one rule `gen` also calls, so the two never
+   disagree. Off reads no state, runs no scan and writes nothing. (`gen` owns the hook entry: one manifest-owned
    SessionStart entry whose command is the constant `workspace prompt`, with
    no path or registry text in it.)
 5. Output. SessionStart stdout enters the model's context, so escaping is too
@@ -73,7 +74,6 @@ import signal
 import sys
 
 DEADLINE_SECONDS = 4.0
-OPT_IN_KEY = "session_prompt"
 STATE_DIR = "state"
 STATE_VERSION = 1
 STATE_KEYS = frozenset(("version", "checked", "snooze_until"))
@@ -204,14 +204,6 @@ def parse_args(args):
     return int(text)
 
 
-def opted_in(document):
-    """`session_prompt: on` at the top of the registry. YAML reads a bare `on` as true."""
-    if not isinstance(document, dict):
-        return False
-    value = document.get(OPT_IN_KEY)
-    return value is True or value == "on"
-
-
 def quiet_today(state, today):
     if state["checked"] == today.isoformat():
         return True
@@ -296,11 +288,12 @@ def run(args):
     folder = None
     try:
         with deadline(DEADLINE_SECONDS):
-            document = scan.parse_registry(scan.registry_snapshot(os.curdir).data)
-            if not opted_in(document):
+            registry = scan.registry_snapshot(os.curdir).data
+            document = scan.parse_registry(registry)
+            on, _ = scan.session_prompt(registry)
+            if not on:
                 return None
-            grammar = {key: value for key, value in document.items() if key != OPT_IN_KEY}
-            code_roots, excluded, declined, projects = scan.validate(grammar)
+            code_roots, excluded, declined, projects = scan.validate(document)
             host = scan.select_host(code_roots, None)
             if not isinstance(host, str) or not HOST.fullmatch(host):
                 raise Quiet("host is not a plain file name")
