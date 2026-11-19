@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.1.0 (2026-11-19)
+
+
+### Features
+
+* add gen, register, decline and scan --edges ([#2](https://github.com/smithadifd/workspace/issues/2)) ([05d6342](https://github.com/smithadifd/workspace/commit/05d63420820c8621c068d682bebefca04c85c926))
+* add the opt-in workspace prompt session-start line ([#3](https://github.com/smithadifd/workspace/issues/3)) ([ad62698](https://github.com/smithadifd/workspace/commit/ad626987bcffae6f9e24541f7ddd849c85d9a252))
+* add the workspace check and scan verbs ([#1](https://github.com/smithadifd/workspace/issues/1)) ([9ddb44c](https://github.com/smithadifd/workspace/commit/9ddb44c80ba761954bb26f37d7a1f988ca808944))
+
+## Changelog
+
 ## Unreleased
 
 The first version: one command, `workspace`, with two read-only verbs and three that write only on a confirm.
