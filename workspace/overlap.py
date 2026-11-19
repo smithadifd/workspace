@@ -175,13 +175,22 @@ def overlap(own, other):
 
 
 def excluded_entries(document):
-    """(entry text, Side) for each excluded entry with a path."""
+    """(entry text, Side) for each excluded entry that names a folder.
+
+    An entry that is neither absolute nor starts with `~` (a placeholder such
+    as `<excluded path 1>` in the shipped template) names no folder on disk,
+    so it has no identity to compare: `gen` refuses it with exit 2 before this
+    rule runs (`scan.exclusion_pattern`), and `check` judges it by its text
+    only, as before. A `~` that cannot be expanded is a could-not-verify.
+    """
     from workspace.check import exclusion_path
 
     entries = []
     for entry in document.get("excluded") or []:
         text = exclusion_path(entry)
         if not text:
+            continue
+        if not text.startswith("~") and not os.path.isabs(text):
             continue
         entries.append((text, Side(scan.exclusion_pattern(text))))
     return entries
