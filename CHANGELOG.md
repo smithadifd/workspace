@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.1.3](https://github.com/smithadifd/workspace/compare/v0.1.2...v0.1.3) (2026-11-19)
+
+
+### Bug Fixes
+
+* **check:** fail when the generated map is stale against the registry ([#11](https://github.com/smithadifd/workspace/issues/11)) ([3db8a62](https://github.com/smithadifd/workspace/commit/3db8a62901a3cdf5cf0f822a9c492170188353fe))
+* **check:** leave per-host files out of the stale-map plan entirely ([#13](https://github.com/smithadifd/workspace/issues/13)) ([7a9c178](https://github.com/smithadifd/workspace/commit/7a9c17841e4f7a9520ac3ac4d65b141f5915e721))
+
 ## [0.1.2](https://github.com/smithadifd/workspace/compare/v0.1.1...v0.1.2) (2026-11-19)
 
 
