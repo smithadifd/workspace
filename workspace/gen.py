@@ -104,6 +104,8 @@ MANIFEST_VERSION = 1
 # and the exact entry is still there; `--adopt` never claims one. A hook gen did
 # not add is never touched, even one that runs the same command, and while one
 # the person wrote runs `workspace prompt` (`runs_prompt`) gen adds none beside it.
+# That exemption holds only while the manifest records no ownership: an owned
+# entry the person edited is a hand edit and the run refuses.
 HOOK_EVENT = "SessionStart"
 HOOK_COMMAND = "workspace prompt"
 HOOK_KEY = "hooks.SessionStart"
@@ -723,9 +725,13 @@ def merge_hook(merged, wanted, owned):
     """Add or remove gen's one SessionStart entry in `merged`; return what gen owns after.
 
     On: an entry equal to gen's is gen's only when the manifest already records
-    owning it; adopting never claims one. Otherwise, when any entry already runs
-    `workspace prompt` (`runs_prompt`), the person wrote it: gen adds nothing and
-    owns nothing. Otherwise gen appends its entry and owns it. Off: remove one
+    owning it; adopting never claims one. Otherwise, when the manifest records no
+    ownership and any entry already runs `workspace prompt` (`runs_prompt`), the
+    person wrote it: gen adds nothing and owns nothing. When the manifest does
+    record ownership and gen's exact entry is gone (edited or removed), gen
+    appends it, so the settings no longer match the record and the run refuses
+    as a hand edit; ownership is never dropped silently. Otherwise gen appends
+    its entry and owns it. Off: remove one
     equal entry, only when the manifest records gen owning it; a `SessionStart`
     list or `hooks` object that removal leaves empty goes too. Nothing else in
     `hooks` is changed.
@@ -736,7 +742,7 @@ def merge_hook(merged, wanted, owned):
         events = hook_list(merged, create=False) or []
         if owns and entry in events:
             return [HOOK_COMMAND]
-        if any(runs_prompt(event) for event in events):
+        if not owns and any(runs_prompt(event) for event in events):
             return []
         hook_list(merged, create=True).append(entry)
         return [HOOK_COMMAND]

@@ -221,6 +221,30 @@ def test_an_owned_entry_removed_by_hand_is_refused_while_on(tmp_path, monkeypatc
     assert "gen-owned entries removed by hand: hooks.SessionStart workspace prompt" in out
 
 
+@pytest.mark.parametrize("edit", [{"timeout": 10}, {"matcher": "startup"}],
+                         ids=["timeout", "matcher"])
+def test_an_owned_entry_edited_by_hand_is_refused_not_dropped(tmp_path, monkeypatch, edit):
+    ws = WS(tmp_path, monkeypatch)
+    set_prompt(ws, "session_prompt: on")
+    generate(ws)
+    assert session_start(ws) == [OWNED]
+    assert hook_owned(ws) == ["workspace prompt"]
+    settings = ws.settings()
+    edited = dict(OWNED, **edit)
+    settings["hooks"]["SessionStart"] = [edited]
+    ws.write(".claude/settings.json", json.dumps(settings, indent=2) + "\n")
+    settings_before = ws.read(".claude/settings.json")
+    manifest_before = ws.read(".workspace-gen.json")
+    code, out = run(ws)
+    assert code == 1, out
+    assert "gen-owned entries removed by hand: hooks.SessionStart workspace prompt" in out
+    code, out = run(ws, "--adopt")
+    assert code == 1, out
+    assert ws.read(".claude/settings.json") == settings_before
+    assert ws.read(".workspace-gen.json") == manifest_before
+    assert hook_owned(ws) == ["workspace prompt"]
+
+
 # --------------------------------------------------------------------------
 # A hooks shape gen cannot merge into
 # --------------------------------------------------------------------------
