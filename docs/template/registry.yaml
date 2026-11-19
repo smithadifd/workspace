@@ -1,0 +1,66 @@
+# A neutral workspace registry to start from.
+#
+# Copy this file into a new workspace folder as `registry.yaml`, replace every
+# angle-bracketed example, and remove the example entries that do not apply.
+# Never seed one system's workspace from another system's registry.
+#
+# `system`: a human-readable name for this workspace.
+# `harness_root`: where this system's standing agent guidance lives, or null.
+# `code_roots`: a host name for each machine, mapped to that machine's code
+#   root. A host name is a plain file name (letters, digits, `.`, `_`, `-`):
+#   `gen` writes `<host>.code-workspace` and `state/gen-<host>.json`.
+# `excluded`: paths that sessions and the tooling must not read. Each entry
+#   needs `path` and `reason`. `gen` writes a Read and an Edit deny rule for each
+#   into `.claude/settings.json`; it never writes a `sandbox` block.
+#
+# Cluster fields: `id` (the key projects use), `name` (shown in the map),
+# `owner`, `lifecycle` and `one_liner`. Lifecycles: active, maintenance,
+# deprecated, sunset, archived. An archived cluster collapses to one map line.
+#
+# Project fields: `name`; the git `remote` (the identity); per-host `paths`;
+# `subpath` (a folder inside the remote, or null); `one_liner` (one line, at
+# most 160 characters); `owner`; `owned_or_reference`; `tier`; `cluster` (one
+# id or a list; the first is where the project's own map line goes);
+# `lifecycle`; `doc`; `confused_with`. Worktrees fold into their parent.
+#
+# Edge fields: `from`, `to`, `kind` (build, source, runtime or protocol),
+# `evidence` and `approved_at`. `register` writes evidence as `path:LINE`,
+# which `scan --edges` can check for staleness. `declined` remembers a remote or
+# path pattern with `date` and `reason`; `rejected_edges` remembers `from`,
+# `to`, `date` and `reason`, so discovery does not propose them again.
+
+system: "<System>"
+harness_root: null
+code_roots:
+  "<host>": "<absolute or ~/ code root>"
+
+excluded:
+  - path: "<excluded path>"
+    reason: "<why sessions must not read this path>"
+
+clusters:
+  - id: "<cluster-id>"
+    name: "<Cluster name>"
+    owner: "<team or person>"
+    lifecycle: active
+    one_liner: "<what this cluster contains>"
+
+projects:
+  - name: "<project-name>"
+    remote: "https://example.invalid/<owner>/<repository>.git"
+    paths: {"<host>": "<absolute or ~/ project path>"}
+    subpath: null
+    one_liner: "<what this project does, in one line>"
+    owner: "<team or person>"
+    owned_or_reference: owned
+    tier: project
+    cluster: "<cluster-id>"
+    lifecycle: active
+    doc: null
+    confused_with: null
+
+edges: []
+
+declined: []
+
+rejected_edges: []

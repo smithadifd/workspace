@@ -58,6 +58,7 @@ Exit codes:
   1  drift
   2  could not verify; the reason is always printed
 """
+import errno
 import fnmatch
 import os
 import re
@@ -482,6 +483,126 @@ def read_file(path, info):
         os.close(handle)
 
 
+# --------------------------------------------------------------------------
+# Workspace files: the one reader of every file below WORKSPACE
+# --------------------------------------------------------------------------
+
+# A workspace file (`registry.yaml`, and every file `gen` reads or replaces) is
+# opened once, by its folder's descriptor, without following a symlink and
+# without blocking on a FIFO, and read only when fstat shows a regular file.
+WORKSPACE_FILE_FLAGS = READ_FLAGS
+NOT_REGULAR = ("%s is not a regular file; a symlink or special file is never read or "
+               "replaced, so make it a regular file in the workspace")
+# What the open gives for a name that is not a regular file: a symlink under
+# O_NOFOLLOW (ELOOP; EMLINK on FreeBSD and NetBSD), or a socket (ENXIO on
+# Linux, EOPNOTSUPP on macOS). A folder, FIFO or device opens and fails fstat.
+NOT_REGULAR_ERRORS = frozenset((errno.ELOOP, errno.EMLINK, errno.ENXIO, errno.EOPNOTSUPP))
+
+
+class NotRegular(Unverifiable):
+    """A workspace file is a symlink, folder, FIFO or other special file.
+
+    `scan` reports it as a could-not-verify; `gen`, `register` and `decline`
+    refuse with it, exit 1, before any write.
+    """
+
+
+class Snapshot:
+    """One read of a workspace file through one descriptor: its bytes, identity and mode."""
+
+    def __init__(self, data, node, mode):
+        self.data = data
+        self.node = node
+        self.mode = mode
+
+    @property
+    def identity(self):
+        return self.node, self.mode
+
+
+def open_regular(folder, name, label):
+    """(descriptor, fstat) of the regular file `name` in the folder descriptor `folder`.
+
+    (None, None) when it does not exist. A symlink, folder, FIFO or other
+    special file is NotRegular. The caller closes the descriptor.
+    """
+    try:
+        handle = os.open(name, WORKSPACE_FILE_FLAGS, dir_fd=folder)
+    except FileNotFoundError:
+        return None, None
+    except OSError as exc:
+        if exc.errno in NOT_REGULAR_ERRORS:
+            raise NotRegular(NOT_REGULAR % label)
+        raise Unverifiable("could not read %s: %s" % (label, exc))
+    try:
+        info = os.fstat(handle)
+    except OSError as exc:
+        os.close(handle)
+        raise Unverifiable("could not read %s: %s" % (label, exc))
+    if not stat.S_ISREG(info.st_mode):
+        os.close(handle)
+        raise NotRegular(NOT_REGULAR % label)
+    return handle, info
+
+
+def read_all(handle):
+    chunks = []
+    while True:
+        chunk = os.read(handle, READ_CHUNK)
+        if not chunk:
+            return b"".join(chunks)
+        chunks.append(chunk)
+
+
+def snapshot_at(folder, name, label):
+    """The Snapshot of the workspace file `name` in `folder`, or None when it does not exist.
+
+    Its bytes, identity and mode all come from the one descriptor `open_regular` gives.
+    """
+    handle, info = open_regular(folder, name, label)
+    if handle is None:
+        return None
+    try:
+        data = read_all(handle)
+    except OSError as exc:
+        raise Unverifiable("could not read %s: %s" % (label, exc))
+    finally:
+        os.close(handle)
+    return Snapshot(data, node_of(info), stat.S_IMODE(info.st_mode))
+
+
+def entry_identity(folder, name):
+    """(node, mode, regular) of the folder entry `name` itself, or None when it is absent.
+
+    It opens nothing and follows no symlink: a writer looks the name up just
+    before a rename, to see that it is still the file it read.
+    """
+    try:
+        info = os.stat(name, dir_fd=folder, follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+    return node_of(info), stat.S_IMODE(info.st_mode), stat.S_ISREG(info.st_mode)
+
+
+def registry_snapshot(workspace):
+    """The one read of `registry.yaml`. WORKSPACE itself resolves as typed."""
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0)
+    try:
+        folder = os.open(workspace, flags)
+    except (FileNotFoundError, NotADirectoryError):
+        raise Unverifiable("workspace is missing or not a folder: %s" % workspace)
+    except OSError as exc:
+        raise Unverifiable("could not read registry: %s" % exc)
+    try:
+        snapshot = snapshot_at(folder, REGISTRY_NAME, REGISTRY_NAME)
+    finally:
+        os.close(folder)
+    if snapshot is None:
+        raise Unverifiable("registry is missing or not a file: %s"
+                           % os.path.join(workspace, REGISTRY_NAME))
+    return snapshot
+
+
 def git_env():
     env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
     env["GIT_CONFIG_NOSYSTEM"] = "1"
@@ -796,6 +917,11 @@ def validate(document):
 
 
 def load_registry(workspace):
+    return parse_registry(registry_snapshot(workspace).data)
+
+
+def parse_registry(data):
+    """The registry document from the bytes of one `registry_snapshot`."""
     from workspace.check import (
         DuplicateKeyError,
         UnhashableKeyError,
@@ -803,16 +929,12 @@ def load_registry(workspace):
         yaml,
     )
 
-    if not os.path.isdir(workspace):
-        raise Unverifiable("workspace is missing or not a folder: %s" % workspace)
-    path = os.path.join(workspace, REGISTRY_NAME)
-    if not os.path.isfile(path):
-        raise Unverifiable("registry is missing or not a file: %s" % path)
     try:
-        with open(path, encoding="utf-8") as handle:
-            text = handle.read()
-    except (OSError, UnicodeDecodeError) as exc:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError as exc:
         raise Unverifiable("could not read registry: %s" % exc)
+    # Line ends as reading the file in text mode gave them.
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
     if not text.strip():
         raise Unverifiable("registry is empty")
     try:
@@ -839,53 +961,18 @@ def declined_match(patterns, remote, path):
     return False
 
 
-def scan(workspace, host):
-    lines = []
-    drift = 0
-    warn = 0
+class Gathered:
+    """What `gather` found: the repos to identify, which registered paths are present, the known repos."""
 
-    code_roots, excluded, declined, projects = validate(load_registry(workspace))
-    if host is None:
-        if len(code_roots) != 1:
-            raise Unverifiable(
-                "no --host given and code_roots names more than one host (%s); pass --host"
-                % ", ".join(sorted(str(name) for name in code_roots))
-            )
-        host = next(iter(code_roots))
-    if host not in code_roots:
-        raise Unverifiable(
-            "host `%s` is not in code_roots (known: %s); pass --host"
-            % (host, ", ".join(sorted(str(name) for name in code_roots)))
-        )
-    root = expand_path(code_roots[host], "code root")
-    exclusions = [exclusion_pattern(path) for path in excluded]
-    if is_excluded(root, exclusions):
-        raise Unverifiable("code root %s is inside an excluded path" % root)
-    nodes = excluded_nodes(exclusions)
+    def __init__(self, candidates, present, known, hops):
+        self.candidates = candidates
+        self.present = present
+        self.known = known
+        self.hops = hops
 
-    registered = {}
-    for project in projects:
-        text = project["paths"].get(host)
-        if text is None:
-            if host in project["required_on"]:
-                drift += 1
-                lines.append("DRIFT  project `%s` is required on host `%s` but has no path for it"
-                             % (project["name"], host))
-            continue
-        path = expand_path(text, "project `%s` path" % project["name"])
-        if is_excluded(path, exclusions):
-            raise Unverifiable("project `%s` path %s is excluded" % (project["name"], path))
-        if not within(path, root) or path == root:
-            raise Unverifiable(
-                "project `%s` path %s is outside the code root %s; not checked"
-                % (project["name"], path, root)
-            )
-        project["path"] = path
-        registered.setdefault(path, []).append(project)
-    for pattern in declined:
-        if pattern.startswith(("/", "~")):
-            expand_path(pattern, "declined path")
 
+def root_scope(root, exclusions, nodes, registered):
+    """The code root, verified as a folder that is not an excluded entry, as a Scope."""
     try:
         info = os.stat(root)
     except OSError as exc:
@@ -894,6 +981,20 @@ def scan(workspace, host):
         raise Unverifiable("code root %s is not a folder" % root)
     if root_is_excluded_node(root, nodes):
         raise Unverifiable("code root %s is inside an excluded path" % root)
+    return Scope(root, info, exclusions, nodes, sorted(registered))
+
+
+def gather(scope, registered, lines):
+    """List the code root one level deep and walk every registered path.
+
+    The one root walker: `scan`, the edge pass and `register` all call it.
+    Returns the repos and worktrees to identify, with their verified hops,
+    whether each registered path is present, and the known repos (each repo
+    folder found directly in the code root or registered, by node identity).
+    Leaves `scope.repo_paths` holding every registered path and every repo in
+    the code root.
+    """
+    root = scope.root
     try:
         names = sorted(os.listdir(root))
     except OSError as exc:
@@ -901,7 +1002,6 @@ def scan(workspace, host):
 
     # The code root's entries: an excluded entry is skipped, any other symlink
     # is a could-not-verify, and a folder is looked inside for its .git marker.
-    scope = Scope(root, info, exclusions, nodes, sorted(registered))
     candidates = []
     for name in names:
         entry = os.path.join(root, name)
@@ -932,12 +1032,15 @@ def scan(workspace, host):
     scope.repo_paths = sorted(set(registered) | {entry for entry, _, _, _ in candidates})
     in_root = {entry for entry, _, _, _ in candidates}
     present = {}
+    walked = {}
     for path in sorted(registered):
         hops = walk_registered(scope, path)
         kind = None
         if hops and stat.S_ISDIR(hops[-1][1].st_mode):
             kind, marker_info = git_marker(scope, hops[-1][0])
         present[path] = kind is not None
+        if kind is not None:
+            walked[path] = hops
         if kind is not None and path not in in_root:
             candidates.append((path, hops, kind, marker_info))
 
@@ -945,6 +1048,88 @@ def scan(workspace, host):
     # so the order of the entries never matters.
     known = {hops[-1][0]: node_of(hops[-1][1])
              for _, hops, kind, _ in candidates if kind == "repo"}
+    return Gathered(candidates, present, known, walked)
+
+
+def select_host(code_roots, host):
+    """The host `scan` reads: the one `code_roots` host, or `host`, which must be a key."""
+    if host is None:
+        if len(code_roots) != 1:
+            raise Unverifiable(
+                "no --host given and code_roots names more than one host (%s); pass --host"
+                % ", ".join(sorted(str(name) for name in code_roots))
+            )
+        host = next(iter(code_roots))
+    if host not in code_roots:
+        raise Unverifiable(
+            "host `%s` is not in code_roots (known: %s); pass --host"
+            % (host, ", ".join(sorted(str(name) for name in code_roots)))
+        )
+    return host
+
+
+def prelude(code_roots, excluded, declined, projects, host):
+    """The code root, the exclusions and the registered paths for `host`, as `scan` judges them.
+
+    Returns (root, exclusions, nodes, registered, unplaced): `registered` maps
+    each registered path to its projects (each project gains its `path`);
+    `unplaced` lists the projects whose `required_on` names `host` but which
+    record no path for it. Anything `scan` cannot verify raises Unverifiable.
+    """
+    root = expand_path(code_roots[host], "code root")
+    exclusions = [exclusion_pattern(path) for path in excluded]
+    if is_excluded(root, exclusions):
+        raise Unverifiable("code root %s is inside an excluded path" % root)
+    nodes = excluded_nodes(exclusions)
+
+    registered = {}
+    unplaced = []
+    for project in projects:
+        text = project["paths"].get(host)
+        if text is None:
+            if host in project["required_on"]:
+                unplaced.append(project)
+            continue
+        path = expand_path(text, "project `%s` path" % project["name"])
+        if is_excluded(path, exclusions):
+            raise Unverifiable("project `%s` path %s is excluded" % (project["name"], path))
+        if not within(path, root) or path == root:
+            raise Unverifiable(
+                "project `%s` path %s is outside the code root %s; not checked"
+                % (project["name"], path, root)
+            )
+        project["path"] = path
+        registered.setdefault(path, []).append(project)
+    for pattern in declined:
+        if pattern.startswith(("/", "~")):
+            expand_path(pattern, "declined path")
+    return root, exclusions, nodes, registered, unplaced
+
+
+def scan(workspace, host, state=None):
+    """The drift scan. With `state`, a dict, it also records what it walked for the edge pass."""
+    lines = []
+    drift = 0
+    warn = 0
+
+    document = load_registry(workspace)
+    code_roots, excluded, declined, projects = validate(document)
+    host = select_host(code_roots, host)
+    root, exclusions, nodes, registered, unplaced = prelude(
+        code_roots, excluded, declined, projects, host)
+    for project in unplaced:
+        drift += 1
+        lines.append("DRIFT  project `%s` is required on host `%s` but has no path for it"
+                     % (project["name"], host))
+
+    scope = root_scope(root, exclusions, nodes, registered)
+    gathered = gather(scope, registered, lines)
+    present = gathered.present
+    candidates = gathered.candidates
+    known = gathered.known
+    if state is not None:
+        state.update(document=document, host=host, root=root, scope=scope,
+                     projects=projects, registered=registered, gathered=gathered)
 
     found = {}
     for entry, hops, kind, marker_info in candidates:
@@ -987,19 +1172,31 @@ def scan(workspace, host):
     return host, root, lines, drift, warn
 
 
-def main(workspace, host=None, out=None):
+def main(workspace, host=None, out=None, edges=False):
     out = sys.stdout if out is None else out
     out.write("== workspace scan ==\n")
+    state = {} if edges else None
     try:
-        host, root, lines, drift, warn = scan(workspace, host)
+        host, root, lines, drift, warn = scan(workspace, host, state)
     except Unverifiable as exc:
         out.write("UNKNOWN  %s\n" % exc)
         return EX_UNKNOWN
     except Exception as exc:  # fail closed: never let a crash read as drift
         out.write("UNKNOWN  scan failed: %s: %s\n" % (type(exc).__name__, exc))
         return EX_UNKNOWN
+    edge_lines = []
+    if edges:
+        # The edge pass runs only once the drift half has its verdict. It
+        # reports unreadable files as WARN lines itself; anything else that
+        # escapes it is a could-not-verify, never a pass.
+        from workspace import edges as edge_pass
+        try:
+            edge_lines = edge_pass.scan_lines(state)
+        except Exception as exc:  # fail closed
+            out.write("UNKNOWN  edge pass failed: %s: %s\n" % (type(exc).__name__, exc))
+            return EX_UNKNOWN
     out.write("host `%s`, code root %s\n" % (host, root))
-    for line in lines:
+    for line in lines + edge_lines:
         out.write(line + "\n")
     if drift:
         out.write("== result: %d drift, %d warn ==\n" % (drift, warn))
