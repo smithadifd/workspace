@@ -460,6 +460,14 @@ To propose a change, open a pull request from a branch. Keep it to one change,
 and add or update a test that fails without it. Both test commands above must
 pass.
 
+Pull request titles are conventional commits, because the squash-merge title
+becomes the commit that release-please reads to choose the next version and to
+write the changelog. Write the title as `type(scope)!: subject`. The type is one
+of `feat`, `fix`, `docs`, `chore`, `refactor`, `test`, `ci`, `build`, `perf`,
+`style` or `revert`, in lower case. The scope in parentheses and the `!` that
+marks a breaking change are optional, and a colon and a space come before the
+subject. The `pr-title` check fails a title that does not read this way.
+
 ## License
 
 MIT. See [LICENSE](LICENSE).
