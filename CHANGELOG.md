@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.2](https://github.com/smithadifd/workspace/compare/v0.1.1...v0.1.2) (2026-11-19)
+
+
+### Bug Fixes
+
+* **check:** a null per-host project path no longer crashes the overlap rule ([#9](https://github.com/smithadifd/workspace/issues/9)) ([dc4b9f6](https://github.com/smithadifd/workspace/commit/dc4b9f6252d4a59a0fb94f09509238d864ebeac6))
+
 ## [0.1.1](https://github.com/smithadifd/workspace/compare/v0.1.0...v0.1.1) (2026-11-19)
 
 
