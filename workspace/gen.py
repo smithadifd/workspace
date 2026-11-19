@@ -99,8 +99,11 @@ MANIFEST_VERSION = 1
 # while gen owns it, so a manifest written before the hook existed reads the
 # same. gen adds the entry only while the registry says `session_prompt: on`
 # (`scan.session_prompt`); when that is off it removes one entry equal to it,
-# and only when the manifest records gen owning it. A hook gen did not add is
-# never touched, even one that runs the same command.
+# and only when the manifest records gen owning it. gen owns the entry only on
+# a run where it appended it, or where the manifest already records owning it
+# and the exact entry is still there; `--adopt` never claims one. A hook gen did
+# not add is never touched, even one that runs the same command, and while one
+# the person wrote runs `workspace prompt` (`runs_prompt`) gen adds none beside it.
 HOOK_EVENT = "SessionStart"
 HOOK_COMMAND = "workspace prompt"
 HOOK_KEY = "hooks.SessionStart"
@@ -707,21 +710,34 @@ def hook_present(settings, owned):
     return [HOOK_COMMAND] if events is not None and hook_entry() in events else []
 
 
-def merge_hook(merged, wanted, owned, adopting):
+def runs_prompt(event):
+    """True when a SessionStart entry has a command hook whose command is exactly HOOK_COMMAND."""
+    hooks = event.get("hooks") if isinstance(event, dict) else None
+    if not isinstance(hooks, list):
+        return False
+    return any(isinstance(hook, dict) and hook.get("type") == "command"
+               and hook.get("command") == HOOK_COMMAND for hook in hooks)
+
+
+def merge_hook(merged, wanted, owned):
     """Add or remove gen's one SessionStart entry in `merged`; return what gen owns after.
 
-    On: add the entry when no equal entry is there. An equal entry already
-    there is gen's only when the manifest records it, or when adopting. Off:
-    remove one equal entry, only when the manifest records gen owning it; a
-    `SessionStart` list or `hooks` object that removal leaves empty goes too.
-    Nothing else in `hooks` is changed.
+    On: an entry equal to gen's is gen's only when the manifest already records
+    owning it; adopting never claims one. Otherwise, when any entry already runs
+    `workspace prompt` (`runs_prompt`), the person wrote it: gen adds nothing and
+    owns nothing. Otherwise gen appends its entry and owns it. Off: remove one
+    equal entry, only when the manifest records gen owning it; a `SessionStart`
+    list or `hooks` object that removal leaves empty goes too. Nothing else in
+    `hooks` is changed.
     """
     owns = HOOK_COMMAND in owned
     entry = hook_entry()
     if wanted:
-        events = hook_list(merged, create=False)
-        if events is not None and entry in events:
-            return [HOOK_COMMAND] if owns or adopting else []
+        events = hook_list(merged, create=False) or []
+        if owns and entry in events:
+            return [HOOK_COMMAND]
+        if any(runs_prompt(event) for event in events):
+            return []
         hook_list(merged, create=True).append(entry)
         return [HOOK_COMMAND]
     if not owns:
@@ -795,7 +811,7 @@ def merge_settings(existing, code_roots, excluded, owned, adopting, session_prom
             if not check.denyread_covers(current, path):
                 add("denyRead", path)
     result = {key: sorted(value) for key, value in owned.items()}
-    hook_owned = merge_hook(merged, session_prompt, hook_owned, adopting)
+    hook_owned = merge_hook(merged, session_prompt, hook_owned)
     if hook_owned:
         result[HOOK_KEY] = hook_owned
     return merged, result

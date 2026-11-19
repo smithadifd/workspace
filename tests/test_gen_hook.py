@@ -129,6 +129,84 @@ def test_an_identical_hand_written_entry_is_never_owned_or_removed(tmp_path, mon
     assert session_start(ws) == [OWNED]  # gen did not add it, so it stays
 
 
+def turn_off_and_keep_bytes(ws):
+    """Turn the opt-in off; the plan names no hook and the settings keep every byte."""
+    before = ws.read(".claude/settings.json")
+    set_prompt(ws, None)
+    code, out = run(ws)
+    assert code == 0, out
+    assert "hooks.SessionStart" not in out
+    generate(ws)
+    assert ws.read(".claude/settings.json") == before
+    assert hook_owned(ws) is None
+
+
+def test_adopt_never_claims_an_equal_hand_entry_on_first_adoption(tmp_path, monkeypatch):
+    ws = WS(tmp_path, monkeypatch)
+    set_prompt(ws, "session_prompt: on")
+    hand_settings(ws, {"SessionStart": [OWNED], "Stop": [STOP]})
+    code, out = run(ws, "--adopt")
+    assert code == 0, out
+    assert "hooks.SessionStart" not in out
+    generate(ws, "--adopt")
+    assert ws.settings()["hooks"] == {"SessionStart": [OWNED], "Stop": [STOP]}
+    assert hook_owned(ws) is None
+    turn_off_and_keep_bytes(ws)
+    assert ws.settings()["hooks"] == {"SessionStart": [OWNED], "Stop": [STOP]}
+
+
+def test_adopt_never_claims_an_equal_hand_entry_with_a_manifest(tmp_path, monkeypatch):
+    ws = WS(tmp_path, monkeypatch)
+    generate(ws)
+    settings = ws.settings()
+    settings["hooks"] = {"SessionStart": [OWNED], "Stop": [STOP]}
+    ws.write(".claude/settings.json", json.dumps(settings, indent=2) + "\n")
+    set_prompt(ws, "session_prompt: on")
+    generate(ws, "--adopt")
+    assert ws.settings()["hooks"] == {"SessionStart": [OWNED], "Stop": [STOP]}
+    assert hook_owned(ws) is None
+    turn_off_and_keep_bytes(ws)
+    assert ws.settings()["hooks"] == {"SessionStart": [OWNED], "Stop": [STOP]}
+
+
+MATCHED_PROMPT = {"matcher": "startup",
+                  "hooks": [{"type": "command", "command": "workspace prompt"}]}
+GROUP_PROMPT = {"hooks": [{"type": "command", "command": "~/bin/hand-hook.sh"},
+                          {"type": "command", "command": "workspace prompt"}]}
+
+
+@pytest.mark.parametrize("hand", [MATCHED_PROMPT, GROUP_PROMPT], ids=["matcher", "group"])
+@pytest.mark.parametrize("flags", [(), ("--adopt",)], ids=["plain", "adopt"])
+def test_no_second_copy_beside_a_hand_hook_that_runs_the_prompt(tmp_path, monkeypatch, hand,
+                                                                  flags):
+    ws = WS(tmp_path, monkeypatch)
+    generate(ws)
+    settings = ws.settings()
+    settings["hooks"] = {"SessionStart": [hand], "Stop": [STOP]}
+    ws.write(".claude/settings.json", json.dumps(settings, indent=2) + "\n")
+    set_prompt(ws, "session_prompt: on")
+    code, out = run(ws, *flags)
+    assert code == 0, out
+    assert "hooks.SessionStart" not in out
+    generate(ws, *flags)
+    assert ws.settings()["hooks"] == {"SessionStart": [hand], "Stop": [STOP]}
+    assert hook_owned(ws) is None
+    check_passes(ws)
+    turn_off_and_keep_bytes(ws)
+    assert ws.settings()["hooks"] == {"SessionStart": [hand], "Stop": [STOP]}
+
+
+@pytest.mark.parametrize("hand", [MATCHED_PROMPT, GROUP_PROMPT], ids=["matcher", "group"])
+def test_no_second_copy_on_first_adoption(tmp_path, monkeypatch, hand):
+    ws = WS(tmp_path, monkeypatch)
+    set_prompt(ws, "session_prompt: on")
+    hand_settings(ws, {"SessionStart": [hand], "Stop": [STOP]})
+    generate(ws, "--adopt")
+    assert ws.settings()["hooks"] == {"SessionStart": [hand], "Stop": [STOP]}
+    assert hook_owned(ws) is None
+    turn_off_and_keep_bytes(ws)
+
+
 def test_an_owned_entry_removed_by_hand_is_refused_while_on(tmp_path, monkeypatch):
     ws = WS(tmp_path, monkeypatch)
     set_prompt(ws, "session_prompt: on")
