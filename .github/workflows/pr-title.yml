@@ -1,0 +1,27 @@
+name: pr-title
+
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+
+jobs:
+  title:
+    name: title
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check the pull request title
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          set -euo pipefail
+          re='^(feat|fix|docs|chore|refactor|test|ci|build|perf|style|revert)(\([^()[:space:]]+\))?!?: [^[:space:]].*$'
+          if [[ "$PR_TITLE" != *$'\n'* && "$PR_TITLE" =~ $re ]]; then
+            echo "The pull request title is a conventional commit."
+            exit 0
+          fi
+          echo "::error title=Pull request title::The title must read type(scope)!: subject. The type is one of feat, fix, docs, chore, refactor, test, ci, build, perf, style, revert; the scope and the ! are optional; a colon and a space come before the subject."
+          exit 1
