@@ -230,14 +230,14 @@ def same_snapshot(now, then):
     return now.data == then.data and now.identity == then.identity
 
 
-def output_folder_gate(workspace):
+def output_folder_gate(workspace, names=OUTPUT_FOLDERS):
     """Refuse a `.claude` or `state` that is a symlink, before anything is read through it.
 
     The files below them, and in the workspace folder, are refused the same way
     when one is not a regular file, by the reader (`read_snapshot`).
     """
     reasons = []
-    for name in OUTPUT_FOLDERS:
+    for name in names:
         try:
             info = os.lstat(os.path.join(workspace, name))
         except FileNotFoundError:
@@ -1015,25 +1015,37 @@ def read_manifest(workspace, rel):
     return snapshot, manifest
 
 
-def make_plan(workspace, host_flag, adopt):
+def make_plan(workspace, host_flag, adopt, shared_only=False):
+    """Render the plan in memory; write nothing.
+
+    `shared_only` is opt-in and is used only by `check`: the plan then holds
+    just the targets that do not depend on a host (`AGENTS.md`, `CLAUDE.md`,
+    `.claude/settings.json`) and the shared manifest. No host is selected, and
+    the per-host files (`<host>.code-workspace`, `state/gen-<host>.json`) and
+    the `state` folder are neither read nor validated. `gen` never sets it.
+    """
     plan = Plan()
     registry = scan.registry_snapshot(workspace)
     document = scan.parse_registry(registry.data)
     session_prompt, session_note = scan.session_prompt(registry.data)
     code_roots, excluded, _, _ = scan.validate(document)
-    host = scan.select_host(code_roots, host_flag)
+    host = None if shared_only else scan.select_host(code_roots, host_flag)
     plan.host = host
     clusters = map_gate(document, code_roots)
     exclusions = [scan.exclusion_pattern(path) for path in excluded]
     path_gate(document, exclusions)
     overlap_gate(document)
     literal_gate(excluded)
-    output_folder_gate(workspace)
+    output_folder_gate(workspace, (".claude",) if shared_only else OUTPUT_FOLDERS)
 
-    state_rel = os.path.join(STATE_DIR, "gen-%s.json" % host)
-    workspace_rel = "%s.code-workspace" % host
     manifest_snapshot, manifest = read_manifest(workspace, MANIFEST_NAME)
-    state_snapshot, state = read_manifest(workspace, state_rel)
+    if shared_only:
+        state_rel = None
+        state_snapshot, state = None, {"version": MANIFEST_VERSION, "files": {}}
+    else:
+        state_rel = os.path.join(STATE_DIR, "gen-%s.json" % host)
+        workspace_rel = "%s.code-workspace" % host
+        state_snapshot, state = read_manifest(workspace, state_rel)
     files = manifest["files"]
     state_files = state["files"]
 
@@ -1085,9 +1097,11 @@ def make_plan(workspace, host_flag, adopt):
         Target(SHIM_NAME, shim_snapshot, SHIM_TEXT.encode("utf-8"), "shim"),
         Target(SETTINGS_REL, settings_snapshot, settings_render, "settings",
                owned_before, owned_after),
-        Target(workspace_rel, read_snapshot(workspace, workspace_rel),
-               render_code_workspace(document, host).encode("utf-8"), "code-workspace"),
     ]
+    if not shared_only:
+        plan.targets.append(
+            Target(workspace_rel, read_snapshot(workspace, workspace_rel),
+                   render_code_workspace(document, host).encode("utf-8"), "code-workspace"))
     reasons = []
     for target in plan.targets:
         records = state_files if target.kind == "code-workspace" else files
@@ -1138,7 +1152,8 @@ def make_plan(workspace, host_flag, adopt):
 
     planned = {target.rel: target.render for target in plan.targets}
     planned[MANIFEST_NAME] = plan.manifest_text
-    planned[state_rel] = plan.state_text
+    if not shared_only:
+        planned[state_rel] = plan.state_text
     plan.digest = plan_digest("gen", [("host", host_flag), ("adopt", bool(adopt))], planned)
 
     lines = [] if session_note is None else ["note   %s" % session_note]
@@ -1157,7 +1172,7 @@ def make_plan(workspace, host_flag, adopt):
                              target.render.decode("utf-8"), target.rel).rstrip("\n"))
     if plan.manifest_text != plan.manifest_data:
         lines.append("record %s" % MANIFEST_NAME)
-    if plan.state_text != plan.state_data:
+    if not shared_only and plan.state_text != plan.state_data:
         lines.append("record %s" % state_rel)
     plan.lines = lines
     return plan

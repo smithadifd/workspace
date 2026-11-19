@@ -44,7 +44,9 @@ is off unless you turn it on, writes only its own state file:
   memory and fails when `AGENTS.md`, `CLAUDE.md`, `.claude/settings.json` or
   `.workspace-gen.json` differs from it (a stale map), naming each file and
   telling you to run `workspace gen WORKSPACE --host HOST`. It compares only
-  the files that do not depend on a host, and writes nothing.
+  those files, which do not depend on a host: the per-host files
+  (`HOST.code-workspace`, `state/gen-HOST.json`) are never read, so editing the
+  editor file cannot turn `check` red. It writes nothing.
 - `workspace scan WORKSPACE` lists this host's code root one level deep and
   reports what the registry does not account for: repositories it does not name
   and has not declined, registered repositories missing on this host, and

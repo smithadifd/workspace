@@ -11,7 +11,7 @@ import re
 
 from workspace import gen
 
-from test_gen import HOST, WS, contents, generate, run, run_cli
+from test_gen import HOST, WS, contents, generate, plan_hash, refused, run, run_cli
 
 NEW_LINER = "Rewritten for the new registry."
 OLD_LINER = "The shop-web project."
@@ -214,3 +214,76 @@ def test_check_writes_nothing(tmp_path, monkeypatch):
     code, out = run_cli("check", str(ws.path))
     assert code == 1, out
     assert tree_state(ws) == before
+
+
+def edit_editor_settings(ws):
+    rel = "%s.code-workspace" % HOST
+    data = json.loads(ws.read(rel))
+    data["settings"] = {"editor.fontSize": 14}
+    ws.write(rel, json.dumps(data, indent=2) + "\n")
+
+
+def test_editing_the_editor_settings_keeps_check_green(tmp_path, monkeypatch):
+    # <host>.code-workspace is the person's editor file; gen would refuse it as
+    # "changed outside gen", but check never reads it.
+    ws = WS(tmp_path, monkeypatch)
+    generate(ws)
+    edit_editor_settings(ws)
+    code, out = run(ws)
+    assert code == 1 and "was changed outside gen" in out, out
+    code, out = run_cli("check", str(ws.path))
+    assert code == 0, "an editor-settings edit turned check red:\n" + out
+    assert "PASS  registry, map, and settings are consistent" in out, out
+
+
+def test_a_corrupt_host_state_file_does_not_change_the_verdict(tmp_path, monkeypatch):
+    ws = WS(tmp_path, monkeypatch)
+    generate(ws)
+    ws.write("state/gen-%s.json" % HOST, "{not json")
+    code, out = run_cli("check", str(ws.path))
+    assert code == 0, "a corrupt host state file changed check's verdict:\n" + out
+    change_liner(ws)
+    code, out = run_cli("check", str(ws.path))
+    assert code == 1, out
+    assert stale_files(out) == ["AGENTS.md", ".workspace-gen.json"], out
+
+
+def test_a_stale_map_still_fails_beside_edited_host_files(tmp_path, monkeypatch):
+    ws = WS(tmp_path, monkeypatch)
+    generate(ws)
+    edit_editor_settings(ws)
+    ws.write("state/gen-%s.json" % HOST, "{not json")
+    change_liner(ws)
+    code, out = run_cli("check", str(ws.path))
+    assert code == 1, out
+    assert stale_files(out) == ["AGENTS.md", ".workspace-gen.json"], out
+    assert "code-workspace" not in out and "gen-%s.json" % HOST not in out, out
+
+
+def test_a_symlinked_state_folder_does_not_change_the_verdict(tmp_path, monkeypatch):
+    ws = WS(tmp_path, monkeypatch)
+    generate(ws)
+    moved = tmp_path / "moved-state"
+    os.rename(ws.file("state"), moved)
+    os.symlink(moved, ws.file("state"))
+    code, out = run(ws)
+    refused(code, out, gen.OUTPUT_LINK % "state")
+    code, out = run_cli("check", str(ws.path))
+    assert code == 0, "a symlinked state folder changed check's verdict:\n" + out
+
+
+def test_shared_only_plan_holds_exactly_the_shared_targets(tmp_path, monkeypatch):
+    ws = WS(tmp_path, monkeypatch)
+    generate(ws)
+    shared = gen.make_plan(str(ws.path), None, False, shared_only=True)
+    assert shared.host is None
+    assert [target.rel for target in shared.targets] == [
+        "AGENTS.md", "CLAUDE.md", ".claude/settings.json"]
+    full = gen.make_plan(str(ws.path), HOST, False)
+    assert [target.rel for target in full.targets] == [
+        "AGENTS.md", "CLAUDE.md", ".claude/settings.json", "%s.code-workspace" % HOST]
+    assert shared.manifest_text == full.manifest_text
+    # gen's own plan is the default one: its printed hash is the full plan's.
+    code, out = run(ws)
+    assert code == 0, out
+    assert plan_hash(out) == full.digest
