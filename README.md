@@ -200,6 +200,19 @@ refusal is decided before the first write, and each file is replaced whole
 (written beside it, then renamed). None of the verbs opens a network
 connection or runs any program other than `git` reading config bytes.
 
+The workspace folder you name is used as you typed it, even when it is a
+symlink. Below it, every file `gen`, `register` or `decline` reads or replaces,
+`registry.yaml` included, is opened once, without following a symlink and
+without waiting on a FIFO, and must be a regular file; a symlink, folder, FIFO
+or other special file there is refused with exit 1, naming it, before anything
+is written, and is never read through or replaced. `scan` reads
+`registry.yaml` the same way, and ends with exit 2 when it is not a regular
+file. A file written takes its mode from that one read: it is never more
+permissive than the file it replaces, and a new `AGENTS.md` whose keep blocks
+come from `CLAUDE.md` takes `CLAUDE.md`'s mode. A file with neither gets the
+usual mode for your umask. Edge evidence is stored in `registry.yaml` as the
+real path and line number; only what is printed to the terminal is escaped.
+
 In `.claude/settings.json`, `gen` owns only the code roots in
 `permissions.additionalDirectories`, a Read and an Edit deny rule for each
 excluded path, and, when you have declared a `sandbox` block yourself, each
@@ -258,6 +271,13 @@ These are not covered:
 - The code root is compared by its text, so a symlinked code root, or a
   symlinked folder above it (such as `/tmp` on macOS), is followed. Write the
   code root as its real path.
+- Just before `gen`, `register` or `decline` renames a new file into place, it
+  looks the name up again, without following a symlink, and refuses unless it
+  is still the file it read (or still absent). A writer that changes the file
+  between that look-up and the rename is not caught. It cannot redirect the
+  write or bring other bytes in, because a rename replaces the folder entry
+  and never writes through a symlink, and the folder is held open; it can only
+  lose its own change to that file.
 
 ## Install
 

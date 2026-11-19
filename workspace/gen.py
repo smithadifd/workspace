@@ -18,11 +18,34 @@ matches. Every refusal is decided before the first write, and what it writes
 always passes `check`: it runs `check` on the rendered map and settings first.
 It runs no other program and opens no network connection.
 
-`.claude` and `state` are refused when either is a symlink, before anything
-is read through them; below the workspace folder, every output file is read
-and written through folders opened without following a symlink. A file gen
-replaces keeps its permission bits: the new bytes go to a temp file only its
-owner can read, which then takes the old file's mode.
+The write path keeps one rule, for `gen`, `register` and `decline` alike:
+
+- WORKSPACE itself resolves as typed. Below it, every file a verb reads or
+  replaces, `registry.yaml` included, is opened once, by its folder's
+  descriptor, with O_NOFOLLOW and O_NONBLOCK, and must fstat as a regular
+  file. A symlink, folder, FIFO or other special file is refused with exit 1,
+  naming it, before any write. Every folder below WORKSPACE is opened without
+  following a symlink, and `.claude` and `state` are refused when either is a
+  symlink, before anything is read through them.
+- That one descriptor gives the file's bytes, identity and mode (a
+  `scan.Snapshot`), and the mode of what is written comes only from it: an
+  output is never more permissive than the file it replaces, or than its
+  keep-block source (a new `AGENTS.md` whose keep blocks come from `CLAUDE.md`
+  takes `CLAUDE.md`'s mode). A file with neither gets the usual mode under the
+  umask. New bytes go to a temp file only its owner can read, which takes that
+  mode before it is renamed into place.
+- Just before each rename the name is looked up once more, without following
+  a symlink, and must still be the regular file that was read, with the same
+  identity and mode, or still be absent. This look-up only detects a change;
+  the guard is the O_NOFOLLOW open. The window between it and the rename is
+  accepted: a rename replaces the folder entry and never writes through a
+  symlink, and the folder is a held descriptor, so a concurrent writer in that
+  window cannot redirect the write or bring in other bytes. It can only lose
+  its own change to that file, and the recheck at the confirm (here) and the
+  registry lock (`register`) bound that.
+- Stored text is raw, and each sink encodes it for itself: an edge's evidence
+  is stored as the real path, quoted for YAML when written, and escaped for
+  the terminal only when printed.
 
 Exit codes: 0 planned or written, 1 refused, 2 could not verify.
 """
@@ -74,6 +97,7 @@ KEEP_SOURCE_MISSING = ("keep block source missing; restore AGENTS.md from git "
                        "(the manifest records a non-empty `%s` keep block)")
 OUTPUT_LINK = ("%s is a symlink; gen never reads or writes through it, so make it a real "
                "folder in the workspace")
+# The same refusal for a file: `scan.NOT_REGULAR`, named with the file's path.
 
 INTRO = """\
 A launchpad, not a project. This map lists the repositories this workspace
@@ -146,8 +170,13 @@ def open_folder(workspace, rel):
     return handle
 
 
-def read_bytes(workspace, rel):
-    """The bytes of the workspace file `rel`, or None when it does not exist."""
+def read_snapshot(workspace, rel):
+    """The `scan.Snapshot` of the workspace file `rel`, or None when it does not exist.
+
+    Its folder is opened step by step without following a symlink, and the
+    file through `scan.snapshot_at`: one O_NOFOLLOW, O_NONBLOCK descriptor
+    that must be a regular file (`scan.NotRegular` otherwise).
+    """
     folder, name = os.path.split(rel)
     try:
         handle = open_folder(workspace, folder)
@@ -156,22 +185,30 @@ def read_bytes(workspace, rel):
     except OSError as exc:
         raise scan.Unverifiable("could not read %s: %s" % (rel, exc))
     try:
-        reader = os.open(name, os.O_RDONLY | CLOEXEC, dir_fd=handle)
-    except FileNotFoundError:
-        return None
-    except OSError as exc:
-        raise scan.Unverifiable("could not read %s: %s" % (rel, exc))
+        return scan.snapshot_at(handle, name, rel)
     finally:
         os.close(handle)
-    try:
-        with os.fdopen(reader, "rb") as stream:
-            return stream.read()
-    except OSError as exc:
-        raise scan.Unverifiable("could not read %s: %s" % (rel, exc))
+
+
+def read_bytes(workspace, rel):
+    """The bytes of the workspace file `rel`, or None when it does not exist."""
+    snapshot = read_snapshot(workspace, rel)
+    return None if snapshot is None else snapshot.data
+
+
+def same_snapshot(now, then):
+    """Whether two reads saw the same file: both absent, or equal bytes, identity and mode."""
+    if now is None or then is None:
+        return now is then
+    return now.data == then.data and now.identity == then.identity
 
 
 def output_folder_gate(workspace):
-    """Refuse a `.claude` or `state` that is a symlink, before anything is read through it."""
+    """Refuse a `.claude` or `state` that is a symlink, before anything is read through it.
+
+    The files below them, and in the workspace folder, are refused the same way
+    when one is not a regular file, by the reader (`read_snapshot`).
+    """
     reasons = []
     for name in OUTPUT_FOLDERS:
         try:
@@ -727,11 +764,18 @@ def render_code_workspace(document, host):
 # --------------------------------------------------------------------------
 
 class Target:
-    """One file gen owns: its current bytes, its render, and how its owned part is hashed."""
+    """One file gen owns: its current snapshot, its render, and how its owned part is hashed.
 
-    def __init__(self, rel, current, render, kind, owned_before=None, owned_after=None):
+    `mode` is the mode the render is written with: the snapshot's, or None for
+    the usual mode of a new file.
+    """
+
+    def __init__(self, rel, snapshot, render, kind, owned_before=None, owned_after=None,
+                 mode=None):
         self.rel = rel
-        self.current = current
+        self.snapshot = snapshot
+        self.current = None if snapshot is None else snapshot.data
+        self.mode = snapshot.mode if snapshot is not None else mode
         self.render = render
         self.kind = kind
         self.owned_before = owned_before
@@ -833,13 +877,13 @@ def manifest_text(manifest):
 
 
 def read_manifest(workspace, rel):
-    data = read_bytes(workspace, rel)
-    if data is None:
+    snapshot = read_snapshot(workspace, rel)
+    if snapshot is None:
         return None, {"version": MANIFEST_VERSION, "files": {}}
-    manifest = load_json(data, rel)
+    manifest = load_json(snapshot.data, rel)
     if manifest.get("version") != MANIFEST_VERSION or not isinstance(manifest.get("files"), dict):
         raise scan.Unverifiable("%s is not a gen manifest this version reads" % rel)
-    return data, manifest
+    return snapshot, manifest
 
 
 def make_plan(workspace, host_flag, adopt):
@@ -856,19 +900,22 @@ def make_plan(workspace, host_flag, adopt):
 
     state_rel = os.path.join(STATE_DIR, "gen-%s.json" % host)
     workspace_rel = "%s.code-workspace" % host
-    manifest_data, manifest = read_manifest(workspace, MANIFEST_NAME)
-    state_data, state = read_manifest(workspace, state_rel)
+    manifest_snapshot, manifest = read_manifest(workspace, MANIFEST_NAME)
+    state_snapshot, state = read_manifest(workspace, state_rel)
     files = manifest["files"]
     state_files = state["files"]
 
-    agents = read_bytes(workspace, MAP_NAME)
-    shim = read_bytes(workspace, SHIM_NAME)
+    agents_snapshot = read_snapshot(workspace, MAP_NAME)
+    shim_snapshot = read_snapshot(workspace, SHIM_NAME)
+    agents = None if agents_snapshot is None else agents_snapshot.data
+    shim = None if shim_snapshot is None else shim_snapshot.data
+    # The keep blocks' source; a new map takes its mode, so copied bytes keep it.
     if agents is not None:
-        keep_source, source = MAP_NAME, agents
+        keep_source, source, source_snapshot = MAP_NAME, agents, agents_snapshot
     elif shim is not None and shim != SHIM_TEXT.encode("utf-8"):
-        keep_source, source = SHIM_NAME, shim
+        keep_source, source, source_snapshot = SHIM_NAME, shim, shim_snapshot
     else:
-        keep_source, source = None, None
+        keep_source, source, source_snapshot = None, None, None
     if source is None:
         keep, marked = {}, False
         recorded = manifest.get("keep") or {}
@@ -882,7 +929,8 @@ def make_plan(workspace, host_flag, adopt):
     budget_gate(map_text)
     import_gate(map_text, document, workspace)
 
-    settings_data = read_bytes(workspace, SETTINGS_REL)
+    settings_snapshot = read_snapshot(workspace, SETTINGS_REL)
+    settings_data = None if settings_snapshot is None else settings_snapshot.data
     existing = {} if settings_data is None else load_json(settings_data, SETTINGS_REL)
     settings_lists(existing, create=False)
     entry = files.get(SETTINGS_REL)
@@ -899,11 +947,12 @@ def make_plan(workspace, host_flag, adopt):
         raise Refusal(*["gen output fails check: %s" % gap for gap in gaps])
 
     plan.targets = [
-        Target(MAP_NAME, agents, map_text.encode("utf-8"), "map"),
-        Target(SHIM_NAME, shim, SHIM_TEXT.encode("utf-8"), "shim"),
-        Target(SETTINGS_REL, settings_data, settings_render, "settings",
+        Target(MAP_NAME, agents_snapshot, map_text.encode("utf-8"), "map",
+               mode=None if source_snapshot is None else source_snapshot.mode),
+        Target(SHIM_NAME, shim_snapshot, SHIM_TEXT.encode("utf-8"), "shim"),
+        Target(SETTINGS_REL, settings_snapshot, settings_render, "settings",
                owned_before, owned_after),
-        Target(workspace_rel, read_bytes(workspace, workspace_rel),
+        Target(workspace_rel, read_snapshot(workspace, workspace_rel),
                render_code_workspace(document, host).encode("utf-8"), "code-workspace"),
     ]
     reasons = []
@@ -948,8 +997,10 @@ def make_plan(workspace, host_flag, adopt):
     plan.state_text = manifest_text(final_state).encode("utf-8")
     plan.pending_manifest = manifest_text(pending).encode("utf-8")
     plan.pending_state = manifest_text(pending_state).encode("utf-8")
-    plan.manifest_data = manifest_data
-    plan.state_data = state_data
+    plan.manifest_snapshot = manifest_snapshot
+    plan.state_snapshot = state_snapshot
+    plan.manifest_data = None if manifest_snapshot is None else manifest_snapshot.data
+    plan.state_data = None if state_snapshot is None else state_snapshot.data
     plan.state_rel = state_rel
 
     planned = {target.rel: target.render for target in plan.targets}
@@ -971,9 +1022,9 @@ def make_plan(workspace, host_flag, adopt):
         lines.append(unified(None if target.current is None
                              else target.current.decode("utf-8", "replace"),
                              target.render.decode("utf-8"), target.rel).rstrip("\n"))
-    if plan.manifest_text != manifest_data:
+    if plan.manifest_text != plan.manifest_data:
         lines.append("record %s" % MANIFEST_NAME)
-    if plan.state_text != state_data:
+    if plan.state_text != plan.state_data:
         lines.append("record %s" % state_rel)
     plan.lines = lines
     return plan
@@ -1010,24 +1061,20 @@ def remove_leftover_temps(workspace):
             os.close(handle)
 
 
-def target_mode(folder, name):
-    """The permission bits of the file `name` in `folder` replaces, or None for a new file."""
-    try:
-        info = os.stat(name, dir_fd=folder, follow_symlinks=False)
-    except FileNotFoundError:
-        return None
-    return stat.S_IMODE(info.st_mode) if stat.S_ISREG(info.st_mode) else None
+class TargetChanged(OSError):
+    """A file is no longer the one the plan read, just before its rename."""
 
 
-def write_temp(folder, name, data):
+def write_temp(folder, name, data, mode):
     """Write `data` to a new temp beside `name` in the folder descriptor `folder`.
 
-    When `name` exists the temp is created readable by its owner only and given
-    that file's mode once written, so a private file never becomes readable by
-    others; a new file gets the usual mode under the umask.
+    `mode` comes only from the snapshot of the file it replaces, or of its
+    keep-block source: the temp is created readable by its owner only and
+    given that mode once written, so it is never more permissive than its
+    source. With no source (`mode` None) it gets the usual mode under the umask.
+    Returns the temp's name and its (node, mode).
     """
     temp = temp_path(name)
-    mode = target_mode(folder, name)
     handle = os.open(temp, TEMP_FLAGS, 0o666 if mode is None else 0o600, dir_fd=folder)
     with os.fdopen(handle, "wb") as stream:
         stream.write(data)
@@ -1035,12 +1082,33 @@ def write_temp(folder, name, data):
         if mode is not None:
             os.fchmod(stream.fileno(), mode)
         os.fsync(stream.fileno())
-    return temp
+        info = os.fstat(stream.fileno())
+    return temp, (scan.node_of(info), stat.S_IMODE(info.st_mode))
 
 
-def write_atomic_at(folder, name, data):
-    temp = write_temp(folder, name, data)
+def require_unchanged(folder, name, expected, rel):
+    """Refuse unless `name` is still the regular file `expected` (node, mode) names, or absent.
+
+    Detection only, just before a rename; the O_NOFOLLOW read is the guard.
+    """
+    now = scan.entry_identity(folder, name)
+    if expected is None:
+        same = now is None
+    else:
+        same = now is not None and now[2] and (now[0], now[1]) == tuple(expected)
+    if not same:
+        raise TargetChanged("%s changed since the plan read it" % rel)
+
+
+def write_atomic(folder, name, data, expected, rel=None):
+    """Replace `name` in the folder descriptor `folder` atomically.
+
+    `expected` is the (node, mode) of the snapshot it replaces, or None for a
+    new file; the new file takes that mode. Returns the new file's (node, mode).
+    """
+    temp, identity = write_temp(folder, name, data, None if expected is None else expected[1])
     try:
+        require_unchanged(folder, name, expected, rel or name)
         os.replace(temp, name, src_dir_fd=folder, dst_dir_fd=folder)
     except BaseException:
         try:
@@ -1048,16 +1116,11 @@ def write_atomic_at(folder, name, data):
         except OSError:
             pass
         raise
+    return identity
 
 
-def write_atomic(path, data):
-    """Replace `path` atomically, keeping its mode."""
-    folder, name = os.path.split(path)
-    handle = os.open(folder or os.curdir, WORKSPACE_FLAGS)
-    try:
-        write_atomic_at(handle, name, data)
-    finally:
-        os.close(handle)
+def identity_of(snapshot):
+    return None if snapshot is None else snapshot.identity
 
 
 def make_folder(workspace_folder, name, made):
@@ -1101,13 +1164,16 @@ def write_through(workspace, plan, writes, folders, out):
             folder, name = os.path.split(target.rel)
             if folder not in folders:
                 folders[folder] = make_folder(folders[""], folder, made)
-            temps.append((write_temp(folders[folder], name, target.render), target))
+            temp, _ = write_temp(folders[folder], name, target.render, target.mode)
+            temps.append((temp, target))
         if state_folder not in folders:
             folders[state_folder] = make_folder(folders[""], state_folder, made)
         # A writer that changed a target since the plan was made loses nothing:
-        # every target must still hold the bytes the plan was made from.
+        # every target must still be the file, bytes, identity and mode, the
+        # plan read. A target that is no longer a regular file is refused by
+        # the reader (scan.NotRegular, an Unverifiable) and undone here too.
         changed = [target.rel for target in plan.targets
-                   if read_bytes(workspace, target.rel) != target.current]
+                   if not same_snapshot(read_snapshot(workspace, target.rel), target.snapshot)]
     except (OSError, scan.Unverifiable) as exc:
         if "" in folders:
             undo()
@@ -1117,16 +1183,22 @@ def write_through(workspace, plan, writes, folders, out):
         undo()
         out.write("REFUSED  %s changed during the run; %s\n" % (", ".join(changed), PLAN_CHANGED))
         return EX_REFUSED
+    manifest_now = identity_of(plan.manifest_snapshot)
+    state_now = identity_of(plan.state_snapshot)
     try:
         if writes:
-            write_atomic_at(folders[""], MANIFEST_NAME, plan.pending_manifest)
-            write_atomic_at(folders[state_folder], state_name, plan.pending_state)
+            manifest_now = write_atomic(folders[""], MANIFEST_NAME, plan.pending_manifest,
+                                        manifest_now)
+            state_now = write_atomic(folders[state_folder], state_name, plan.pending_state,
+                                     state_now, plan.state_rel)
         for temp, target in temps:
             folder, name = os.path.split(target.rel)
+            require_unchanged(folders[folder], name, identity_of(target.snapshot), target.rel)
             os.replace(temp, name, src_dir_fd=folders[folder], dst_dir_fd=folders[folder])
             out.write("wrote  %s\n" % target.rel)
-        write_atomic_at(folders[""], MANIFEST_NAME, plan.manifest_text)
-        write_atomic_at(folders[state_folder], state_name, plan.state_text)
+        write_atomic(folders[""], MANIFEST_NAME, plan.manifest_text, manifest_now)
+        write_atomic(folders[state_folder], state_name, plan.state_text, state_now,
+                     plan.state_rel)
     except OSError as exc:
         remove_leftover_temps(workspace)
         out.write("UNKNOWN  the write stopped part way: %s; rerun gen to finish it\n" % exc)
@@ -1140,6 +1212,10 @@ def main(workspace, host=None, adopt=False, write=False, expect=None, out=None):
     out.write("== workspace gen ==\n")
     try:
         plan = make_plan(workspace, host, adopt)
+    except scan.NotRegular as exc:
+        out.write("REFUSED  %s\n" % exc)
+        out.write("nothing written\n")
+        return EX_REFUSED
     except scan.Unverifiable as exc:
         out.write("UNKNOWN  %s\n" % exc)
         return EX_UNKNOWN

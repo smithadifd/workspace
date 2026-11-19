@@ -18,6 +18,14 @@ into the file (comments, order and formatting stay) and refuse a splice that
 does not reparse to the old registry plus exactly the new entries. Only
 `registry.yaml` is written; run `workspace gen` afterwards.
 
+`registry.yaml` keeps gen's write-path rule (see `workspace.gen`): it is read
+once, through one descriptor opened by the workspace folder's descriptor
+without following a symlink, and must be a regular file, or the verb refuses
+with exit 1. The confirmed write re-opens it the same way, locks it, checks
+that the name is still that file and still holds the planned bytes, and the
+new file takes the locked file's mode. Drafted edge evidence is stored as the
+real path and line, quoted for YAML; only the plan's terminal output escapes.
+
 Exit codes: 0 planned or written, 1 refused, 2 could not verify.
 """
 import copy
@@ -156,14 +164,15 @@ def verified_splice(text, document, additions):
     return new_text
 
 
-def read_registry_text(workspace):
-    path = os.path.join(workspace, scan.REGISTRY_NAME)
+def read_registry(workspace):
+    """The registry's one snapshot, and the document parsed from those same bytes."""
     try:
-        with open(path, "rb") as handle:
-            data = handle.read()
-    except OSError as exc:
+        snapshot = scan.registry_snapshot(workspace)
+    except scan.NotRegular:
+        raise
+    except scan.Unverifiable as exc:
         raise scan.Unverifiable("could not read registry: %s" % exc)
-    return data
+    return snapshot, scan.parse_registry(snapshot.data)
 
 
 def read_handle(handle):
@@ -180,26 +189,38 @@ def write_registry(workspace, data, new_text):
 
     The comparison and the replacement run under an exclusive lock on the
     registry file, so two confirmed writes never both pass the comparison: the
-    one that waits then finds the file replaced, and refuses.
+    one that waits then finds the file replaced, and refuses. The file is
+    opened by the workspace folder's descriptor without following a symlink
+    and must be a regular file; under the lock, its name, looked up without
+    following a symlink, must still be that file. The new file takes the mode
+    of the locked file.
     """
-    path = os.path.join(workspace, scan.REGISTRY_NAME)
     try:
-        handle = os.open(path, os.O_RDONLY | getattr(os, "O_CLOEXEC", 0))
+        folder = gen.open_folder(workspace, "")
     except OSError as exc:
         raise scan.Unverifiable("could not read registry: %s" % exc)
     try:
-        fcntl.flock(handle, fcntl.LOCK_EX)
+        handle, _ = scan.open_regular(folder, scan.REGISTRY_NAME, scan.REGISTRY_NAME)
+        if handle is None:
+            raise scan.Unverifiable("could not read registry: %s is missing"
+                                    % scan.REGISTRY_NAME)
         try:
-            now = os.stat(path)
-        except FileNotFoundError:
-            raise Refusal(PLAN_CHANGED)
-        if scan.node_of(os.fstat(handle)) != scan.node_of(now):
-            raise Refusal(PLAN_CHANGED)
-        if read_handle(handle) != data:
-            raise Refusal(PLAN_CHANGED)
-        gen.write_atomic(path, new_text.encode("utf-8"))
+            fcntl.flock(handle, fcntl.LOCK_EX)
+            locked = os.fstat(handle)
+            now = scan.entry_identity(folder, scan.REGISTRY_NAME)
+            if now is None or not now[2] or now[0] != scan.node_of(locked):
+                raise Refusal(PLAN_CHANGED)
+            if read_handle(handle) != data:
+                raise Refusal(PLAN_CHANGED)
+            try:
+                gen.write_atomic(folder, scan.REGISTRY_NAME, new_text.encode("utf-8"),
+                                 (scan.node_of(locked), stat.S_IMODE(locked.st_mode)))
+            except gen.TargetChanged:
+                raise Refusal(PLAN_CHANGED)
+        finally:
+            os.close(handle)
     finally:
-        os.close(handle)
+        os.close(folder)
 
 
 def emit_plan(out, data, new_text, digest, notes):
@@ -229,6 +250,9 @@ def run(verb, plan, request, out):
     out.write("== workspace %s ==\n" % verb)
     try:
         return plan(request, out)
+    except scan.NotRegular as exc:
+        out.write("REFUSED  %s\n" % exc)
+        return EX_REFUSED
     except scan.Unverifiable as exc:
         out.write("UNKNOWN  %s\n" % exc)
         return EX_UNKNOWN
@@ -295,8 +319,8 @@ def look_alikes(name, basename, projects):
 def register_plan(request, out):
     workspace = request["workspace"]
     path_text = request["path"]
-    data = read_registry_text(workspace)
-    document = scan.load_registry(workspace)
+    snapshot, document = read_registry(workspace)
+    data = snapshot.data
     code_roots, excluded, declined, projects = scan.validate(copy.deepcopy(document))
     host = scan.select_host(code_roots, request["host"])
 
@@ -440,8 +464,8 @@ def decline_plan(request, out):
     workspace = request["workspace"]
     pattern = request["pattern"]
     reason = request["reason"]
-    data = read_registry_text(workspace)
-    document = scan.load_registry(workspace)
+    snapshot, document = read_registry(workspace)
+    data = snapshot.data
     _, _, declined, projects = scan.validate(copy.deepcopy(document))
     reasons = []
     if not reason.strip():

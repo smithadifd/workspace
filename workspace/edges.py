@@ -13,10 +13,12 @@ that starts with `.env` is skipped before any file call, and a folder holding
 
 What cannot be read is a WARN line, never a could-not-verify: the drift
 verdict stands. A symlink or an excluded entry is counted on one INFO line.
-Evidence is a path and a line number, never the line's text. A path from
-inside a repository is printed with every backslash and every character
-that is not printable escaped, so a file name cannot start a line of its
-own or send control bytes to the terminal.
+Evidence is a path and a line number, never the line's text. It is kept
+raw, as the real path, and each sink encodes it for itself: `register`
+stores it quoted for YAML, and a path from inside a repository is printed
+with every backslash and every character that is not printable escaped, so
+a file name cannot start a line of its own or send control bytes to the
+terminal.
 """
 import os
 import re
@@ -229,8 +231,9 @@ class EdgeWalk:
 
 
 def evidence_text(evidence):
+    """The first evidence as `path:LINE`, raw: the real path, for storage and for display."""
     rel, number = evidence[0]
-    return "%s:%d" % (printable(rel), number)
+    return "%s:%d" % (rel, number)
 
 
 def edge_pairs(document, key):
@@ -286,7 +289,8 @@ def scan_lines(state):
     lifecycle = {project["name"]: project["lifecycle"] for project in projects}
     candidates = []
     for (origin, target, kind), evidence in candidate_edges(findings, document).items():
-        candidates.append(CANDIDATE_LINE % (origin, target, kind, evidence_text(evidence)))
+        candidates.append(CANDIDATE_LINE % (origin, target, kind,
+                                            printable(evidence_text(evidence))))
 
     stale = []
     not_checked = []

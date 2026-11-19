@@ -4,6 +4,7 @@ Every fixture is a temp workspace with synthetic names; HOME is the temp dir,
 so `~/src` is the code root and `~/private` an excluded folder. gen never
 touches a repository, so no repo is created unless a test needs one.
 """
+import ast
 import io
 import json
 import os
@@ -839,8 +840,8 @@ def test_a_target_changed_during_the_write_is_not_overwritten(tmp_path, monkeypa
     code, out = run(ws)
     original = gen.write_temp
 
-    def racing(folder, name, data):
-        temp = original(folder, name, data)
+    def racing(folder, name, data, *rest):
+        temp = original(folder, name, data, *rest)
         if name == "AGENTS.md":
             ws.write("AGENTS.md", ws.read("AGENTS.md") + "a racing writer's line\n")
         return temp
@@ -1428,3 +1429,227 @@ def test_template_registry_follows_the_grammar():
     guide = (folder / "README.md").read_text(encoding="utf-8")
     assert "workspace gen" in guide and "workspace register" in guide
     assert "*.code-workspace" in guide and "workspace:keep" in guide
+
+
+# --------------------------------------------------------------------------
+# W. The write-path rule: one O_NOFOLLOW, O_NONBLOCK read of a regular file;
+#    the mode comes only from that read
+# --------------------------------------------------------------------------
+
+OUTPUT_FILES = ("AGENTS.md", "CLAUDE.md", ".claude/settings.json", "desk.code-workspace",
+                ".workspace-gen.json", "state/gen-desk.json")
+
+
+def private_file(tmp_path, name, text):
+    """A 0600 file outside the workspace, beneath the excluded ~/private."""
+    folder = tmp_path / "private"
+    folder.mkdir(exist_ok=True)
+    path = folder / name
+    path.write_text(text, encoding="utf-8")
+    path.chmod(0o600)
+    return path
+
+
+@pytest.mark.parametrize("rel", OUTPUT_FILES)
+def test_a_linked_output_file_is_refused_and_never_followed(tmp_path, monkeypatch, umask_022,
+                                                           rel):
+    ws = WS(tmp_path, monkeypatch)
+    secret = private_file(tmp_path, "secret.json", json.dumps(CREDENTIAL))
+    link = ws.file(rel)
+    link.parent.mkdir(parents=True, exist_ok=True)
+    os.symlink(secret, link)
+    before = contents(tmp_path)
+    for flags, expect in (((), None), (("--adopt",), None), (("--adopt",), "0" * 64)):
+        code, out = run(ws, *flags, expect=expect)
+        refused(code, out, scan.NOT_REGULAR % rel)
+        assert "SENTINEL" not in out, out
+    assert contents(tmp_path) == before
+    assert os.readlink(link) == str(secret)
+    assert stat.S_IMODE(secret.stat().st_mode) == 0o600
+
+
+@pytest.mark.parametrize("verb", ["gen", "register", "decline"])
+def test_a_linked_registry_is_refused_for_every_writing_verb(tmp_path, monkeypatch, verb):
+    ws = WS(tmp_path, monkeypatch)
+    secret = private_file(tmp_path, "registry-secret",
+                          "REGISTRY_SENTINEL: [this is not yaml\n")
+    ws.file("registry.yaml").unlink()
+    os.symlink(secret, ws.file("registry.yaml"))
+    before = contents(tmp_path)
+    args = {"gen": ["gen", str(ws.path)],
+            "register": ["register", str(ws.path), "~/src/x", "--cluster", "shop",
+                         "--one-liner", "x"],
+            "decline": ["decline", str(ws.path), "pat", "--reason", "r"]}[verb]
+    for extra in ([], ["--write", "--expect", "0" * 64]):
+        code, out = run_cli(*args, *extra)
+        assert code == 1, out
+        assert "REFUSED  " + scan.NOT_REGULAR % "registry.yaml" in out, out
+        assert "SENTINEL" not in out, out
+    assert contents(tmp_path) == before
+    assert os.readlink(ws.file("registry.yaml")) == str(secret)
+    assert stat.S_IMODE(secret.stat().st_mode) == 0o600
+
+
+def test_a_fifo_at_the_map_is_refused_not_waited_on(tmp_path, monkeypatch):
+    ws = WS(tmp_path, monkeypatch)
+    os.mkfifo(ws.file("AGENTS.md"))
+    env = dict(os.environ, PYTHONPATH=str(REPO_ROOT))
+    result = subprocess.run([sys.executable, "-P", "-m", "workspace", "gen", str(ws.path),
+                             "--adopt"], capture_output=True, text=True, env=env, check=False,
+                            timeout=60)
+    out = result.stdout + result.stderr
+    assert result.returncode == 1, out
+    assert "REFUSED  " + scan.NOT_REGULAR % "AGENTS.md" in out, out
+    assert stat.S_ISFIFO(os.lstat(ws.file("AGENTS.md")).st_mode)
+    assert sorted(os.listdir(ws.path)) == ["AGENTS.md", "registry.yaml"]
+
+
+def swapped_after_the_plan(tmp_path, monkeypatch):
+    """A hand-kept map, a plan that adopts it, and the map's bytes outside the workspace."""
+    ws = WS(tmp_path, monkeypatch)
+    hand = keep_text(top="mine\n")
+    ws.write("AGENTS.md", hand)
+    plan = gen.make_plan(str(ws.path), HOST, True)
+    return ws, hand, plan
+
+
+def test_a_target_swapped_for_a_link_after_the_plan_is_refused_and_undone(tmp_path,
+                                                                          monkeypatch):
+    ws, hand, plan = swapped_after_the_plan(tmp_path, monkeypatch)
+    copy = private_file(tmp_path, "AGENTS.md", hand)
+    ws.file("AGENTS.md").unlink()
+    os.symlink(copy, ws.file("AGENTS.md"))
+    buffer = io.StringIO()
+    code = gen.write_plan(str(ws.path), plan, buffer)
+    out = buffer.getvalue()
+    assert code == 1, out
+    assert "REFUSED  could not write: " + scan.NOT_REGULAR % "AGENTS.md" in out, out
+    # No temp left, and the .claude and state folders the write made are gone.
+    assert sorted(os.listdir(ws.path)) == ["AGENTS.md", "registry.yaml"]
+    assert os.readlink(ws.file("AGENTS.md")) == str(copy)
+    assert copy.read_text(encoding="utf-8") == hand
+    assert stat.S_IMODE(copy.stat().st_mode) == 0o600
+
+
+def test_a_target_swapped_for_a_copy_with_the_same_bytes_is_refused(tmp_path, monkeypatch):
+    ws, hand, plan = swapped_after_the_plan(tmp_path, monkeypatch)
+    swap = ws.file("swap.tmp")
+    swap.write_text(hand, encoding="utf-8")
+    swap.chmod(stat.S_IMODE(ws.file("AGENTS.md").stat().st_mode))
+    os.replace(swap, ws.file("AGENTS.md"))
+    buffer = io.StringIO()
+    code = gen.write_plan(str(ws.path), plan, buffer)
+    refused(code, buffer.getvalue(), "AGENTS.md changed during the run")
+    assert sorted(os.listdir(ws.path)) == ["AGENTS.md", "registry.yaml"]
+    assert ws.read("AGENTS.md") == hand
+
+
+def test_a_target_swapped_just_before_its_rename_is_not_replaced(tmp_path, monkeypatch):
+    ws, hand, plan = swapped_after_the_plan(tmp_path, monkeypatch)
+    original = gen.write_atomic
+    calls = []
+
+    def swapping(folder, name, *rest):
+        # After the recheck: the pending manifest is the first write, before any rename.
+        identity = original(folder, name, *rest)
+        calls.append(name)
+        if len(calls) == 1:
+            swap = ws.file("swap.tmp")
+            swap.write_text(hand, encoding="utf-8")
+            os.replace(swap, ws.file("AGENTS.md"))
+        return identity
+
+    monkeypatch.setattr(gen, "write_atomic", swapping)
+    buffer = io.StringIO()
+    code = gen.write_plan(str(ws.path), plan, buffer)
+    out = buffer.getvalue()
+    assert code == 2, out
+    assert "AGENTS.md changed since the plan read it" in out, out
+    assert ws.read("AGENTS.md") == hand
+    leftovers = [name for name in contents(ws.path) if name.endswith(gen.TEMP_SUFFIX)]
+    assert leftovers == []
+
+
+def test_a_new_map_takes_the_mode_of_its_keep_source(tmp_path, monkeypatch, umask_022):
+    ws = WS(tmp_path, monkeypatch)
+    ws.write("CLAUDE.md", keep_text(top="private notes\n"))
+    ws.file("CLAUDE.md").chmod(0o600)
+    written = generate(ws, "--adopt")
+    assert "wrote  AGENTS.md" in written, written
+    assert "private notes\n" in ws.read("AGENTS.md")
+    assert stat.S_IMODE(ws.file("AGENTS.md").stat().st_mode) == 0o600
+    assert stat.S_IMODE(ws.file("CLAUDE.md").stat().st_mode) == 0o600
+
+
+def test_gen_through_a_symlinked_workspace_argument_writes(tmp_path, monkeypatch):
+    ws = WS(tmp_path, monkeypatch)
+    alias = tmp_path / "alias"
+    os.symlink(ws.path, alias)
+    buffer = io.StringIO()
+    code = gen.main(str(alias), host=HOST, out=buffer)
+    assert code == 0, buffer.getvalue()
+    written = io.StringIO()
+    code = gen.main(str(alias), host=HOST, write=True, expect=plan_hash(buffer.getvalue()),
+                    out=written)
+    assert code == 0, written.getvalue()
+    for rel in OUTPUT_FILES:
+        assert ws.file(rel).is_file() and not ws.file(rel).is_symlink(), rel
+    check_passes(ws)
+
+
+# Each file call gen.py and register.py may make, and the only functions that
+# make it. Every workspace file is read through scan.snapshot_at (via
+# gen.read_snapshot or scan.registry_snapshot), never by these modules.
+FILE_CALLS = {
+    "gen.py": {
+        "os.open": {"open_folder", "make_folder", "write_temp"},
+        "os.fdopen": {"write_temp"},
+        "os.lstat": {"output_folder_gate", "literal_gate"},
+        "os.listdir": {"remove_leftover_temps"},
+    },
+    "register.py": {},
+}
+WATCHED = ("open", "io.open", "os.open", "os.fdopen", "os.stat", "os.lstat", "os.listdir",
+           "os.scandir", "os.path.isfile", "os.path.isdir", "os.path.exists",
+           "os.path.islink", "os.path.getsize")
+WATCHED_METHODS = ("open", "read_bytes", "read_text", "write_bytes", "write_text")
+
+
+def file_calls(source):
+    """(call, enclosing function) for every watched file call in `source`."""
+    found = []
+
+    def dotted(node):
+        if isinstance(node, ast.Name):
+            return node.id
+        if isinstance(node, ast.Attribute):
+            base = dotted(node.value)
+            return None if base is None else base + "." + node.attr
+        return None
+
+    def visit(node, function):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            function = node.name
+        if isinstance(node, ast.Call):
+            name = dotted(node.func)
+            if name in WATCHED:
+                found.append((name, function))
+            elif (isinstance(node.func, ast.Attribute) and node.func.attr in WATCHED_METHODS
+                  and not (name or "").startswith("os.")):
+                found.append(("." + node.func.attr, function))
+        for child in ast.iter_child_nodes(node):
+            visit(child, function)
+
+    visit(ast.parse(source), None)
+    return found
+
+
+def test_workspace_files_are_read_only_through_the_snapshot_helpers():
+    for module, allowed in FILE_CALLS.items():
+        source = (REPO_ROOT / "workspace" / module).read_text(encoding="utf-8")
+        for call, function in file_calls(source):
+            assert function in allowed.get(call, set()), (
+                "%s calls %s in %s; read a workspace file through the snapshot reader"
+                % (module, call, function))
+    assert scan.WORKSPACE_FILE_FLAGS & os.O_NOFOLLOW
+    assert scan.WORKSPACE_FILE_FLAGS & os.O_NONBLOCK

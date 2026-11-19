@@ -58,6 +58,7 @@ Exit codes:
   1  drift
   2  could not verify; the reason is always printed
 """
+import errno
 import fnmatch
 import os
 import re
@@ -482,6 +483,126 @@ def read_file(path, info):
         os.close(handle)
 
 
+# --------------------------------------------------------------------------
+# Workspace files: the one reader of every file below WORKSPACE
+# --------------------------------------------------------------------------
+
+# A workspace file (`registry.yaml`, and every file `gen` reads or replaces) is
+# opened once, by its folder's descriptor, without following a symlink and
+# without blocking on a FIFO, and read only when fstat shows a regular file.
+WORKSPACE_FILE_FLAGS = READ_FLAGS
+NOT_REGULAR = ("%s is not a regular file; a symlink or special file is never read or "
+               "replaced, so make it a regular file in the workspace")
+# What the open gives for a name that is not a regular file: a symlink under
+# O_NOFOLLOW (ELOOP; EMLINK on FreeBSD and NetBSD), or a socket (ENXIO on
+# Linux, EOPNOTSUPP on macOS). A folder, FIFO or device opens and fails fstat.
+NOT_REGULAR_ERRORS = frozenset((errno.ELOOP, errno.EMLINK, errno.ENXIO, errno.EOPNOTSUPP))
+
+
+class NotRegular(Unverifiable):
+    """A workspace file is a symlink, folder, FIFO or other special file.
+
+    `scan` reports it as a could-not-verify; `gen`, `register` and `decline`
+    refuse with it, exit 1, before any write.
+    """
+
+
+class Snapshot:
+    """One read of a workspace file through one descriptor: its bytes, identity and mode."""
+
+    def __init__(self, data, node, mode):
+        self.data = data
+        self.node = node
+        self.mode = mode
+
+    @property
+    def identity(self):
+        return self.node, self.mode
+
+
+def open_regular(folder, name, label):
+    """(descriptor, fstat) of the regular file `name` in the folder descriptor `folder`.
+
+    (None, None) when it does not exist. A symlink, folder, FIFO or other
+    special file is NotRegular. The caller closes the descriptor.
+    """
+    try:
+        handle = os.open(name, WORKSPACE_FILE_FLAGS, dir_fd=folder)
+    except FileNotFoundError:
+        return None, None
+    except OSError as exc:
+        if exc.errno in NOT_REGULAR_ERRORS:
+            raise NotRegular(NOT_REGULAR % label)
+        raise Unverifiable("could not read %s: %s" % (label, exc))
+    try:
+        info = os.fstat(handle)
+    except OSError as exc:
+        os.close(handle)
+        raise Unverifiable("could not read %s: %s" % (label, exc))
+    if not stat.S_ISREG(info.st_mode):
+        os.close(handle)
+        raise NotRegular(NOT_REGULAR % label)
+    return handle, info
+
+
+def read_all(handle):
+    chunks = []
+    while True:
+        chunk = os.read(handle, READ_CHUNK)
+        if not chunk:
+            return b"".join(chunks)
+        chunks.append(chunk)
+
+
+def snapshot_at(folder, name, label):
+    """The Snapshot of the workspace file `name` in `folder`, or None when it does not exist.
+
+    Its bytes, identity and mode all come from the one descriptor `open_regular` gives.
+    """
+    handle, info = open_regular(folder, name, label)
+    if handle is None:
+        return None
+    try:
+        data = read_all(handle)
+    except OSError as exc:
+        raise Unverifiable("could not read %s: %s" % (label, exc))
+    finally:
+        os.close(handle)
+    return Snapshot(data, node_of(info), stat.S_IMODE(info.st_mode))
+
+
+def entry_identity(folder, name):
+    """(node, mode, regular) of the folder entry `name` itself, or None when it is absent.
+
+    It opens nothing and follows no symlink: a writer looks the name up just
+    before a rename, to see that it is still the file it read.
+    """
+    try:
+        info = os.stat(name, dir_fd=folder, follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+    return node_of(info), stat.S_IMODE(info.st_mode), stat.S_ISREG(info.st_mode)
+
+
+def registry_snapshot(workspace):
+    """The one read of `registry.yaml`. WORKSPACE itself resolves as typed."""
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0)
+    try:
+        folder = os.open(workspace, flags)
+    except (FileNotFoundError, NotADirectoryError):
+        raise Unverifiable("workspace is missing or not a folder: %s" % workspace)
+    except OSError as exc:
+        raise Unverifiable("could not read registry: %s" % exc)
+    try:
+        snapshot = snapshot_at(folder, REGISTRY_NAME, REGISTRY_NAME)
+    finally:
+        os.close(folder)
+    if snapshot is None:
+        raise Unverifiable("registry is missing or not a file: %s"
+                           % os.path.join(workspace, REGISTRY_NAME))
+    return snapshot
+
+
 def git_env():
     env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
     env["GIT_CONFIG_NOSYSTEM"] = "1"
@@ -796,6 +917,11 @@ def validate(document):
 
 
 def load_registry(workspace):
+    return parse_registry(registry_snapshot(workspace).data)
+
+
+def parse_registry(data):
+    """The registry document from the bytes of one `registry_snapshot`."""
     from workspace.check import (
         DuplicateKeyError,
         UnhashableKeyError,
@@ -803,16 +929,12 @@ def load_registry(workspace):
         yaml,
     )
 
-    if not os.path.isdir(workspace):
-        raise Unverifiable("workspace is missing or not a folder: %s" % workspace)
-    path = os.path.join(workspace, REGISTRY_NAME)
-    if not os.path.isfile(path):
-        raise Unverifiable("registry is missing or not a file: %s" % path)
     try:
-        with open(path, encoding="utf-8") as handle:
-            text = handle.read()
-    except (OSError, UnicodeDecodeError) as exc:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError as exc:
         raise Unverifiable("could not read registry: %s" % exc)
+    # Line ends as reading the file in text mode gave them.
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
     if not text.strip():
         raise Unverifiable("registry is empty")
     try:

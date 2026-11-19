@@ -788,13 +788,13 @@ def test_concurrent_confirmed_writes_never_lose_an_addition(tmp_path, monkeypatc
             b_at_lock.set()
         return real_flock(handle, operation)
 
-    def write_atomic(path, data):
+    def write_atomic(*args):
         if threading.current_thread().name == "A":
             # A has compared the registry bytes. B runs up to its lock (or, with
             # no lock, to its end) before A replaces the file.
             b_may_run.set()
             assert b_at_lock.wait(10)
-        return real_write(path, data)
+        return real_write(*args)
 
     results = {}
 
@@ -832,3 +832,91 @@ def test_a_written_registry_keeps_its_mode(tmp_path, monkeypatch):
     finally:
         os.umask(old)
     assert stat.S_IMODE((reg.ws / "registry.yaml").stat().st_mode) == 0o600
+
+
+# --------------------------------------------------------------------------
+# The write-path rule for registry.yaml, and raw evidence
+# --------------------------------------------------------------------------
+
+def test_registry_swapped_for_a_link_at_the_lock_is_not_written(tmp_path, monkeypatch):
+    reg = Reg(tmp_path, monkeypatch)
+    registry = reg.ws / "registry.yaml"
+    registry.chmod(0o600)
+    code, out = run_decline(reg, "~/src/tmp-*")
+    digest = plan_hash(out)
+    moved = tmp_path / "rooms" / "registry.yaml"
+    real_flock = fcntl.flock
+
+    def flock(handle, operation):
+        # Another writer swaps the name for a link to the same file once the lock is held.
+        result = real_flock(handle, operation)
+        if not os.path.islink(registry):
+            os.replace(registry, moved)
+            os.symlink(moved, registry)
+        return result
+
+    monkeypatch.setattr(register.fcntl, "flock", flock)
+    refused(*run_decline(reg, "~/src/tmp-*", expect=digest), register.PLAN_CHANGED)
+    assert os.readlink(registry) == str(moved)
+    assert moved.read_text(encoding="utf-8") == REGISTRY
+    assert stat.S_IMODE(moved.stat().st_mode) == 0o600
+
+
+def test_registry_swapped_after_the_locked_read_is_not_written(tmp_path, monkeypatch):
+    reg = Reg(tmp_path, monkeypatch)
+    registry = reg.ws / "registry.yaml"
+    code, out = run_decline(reg, "~/src/tmp-*")
+    digest = plan_hash(out)
+    moved = tmp_path / "rooms" / "registry.yaml"
+    real_read = register.read_handle
+
+    def read_handle(handle):
+        # The swap lands after the locked identity check, just before the rename.
+        data = real_read(handle)
+        os.replace(registry, moved)
+        os.symlink(moved, registry)
+        return data
+
+    monkeypatch.setattr(register, "read_handle", read_handle)
+    refused(*run_decline(reg, "~/src/tmp-*", expect=digest), register.PLAN_CHANGED)
+    assert os.readlink(registry) == str(moved)
+    assert moved.read_text(encoding="utf-8") == REGISTRY
+    leftovers = [name for name in os.listdir(reg.ws) if name.endswith(gen.TEMP_SUFFIX)]
+    assert leftovers == []
+
+
+def test_a_linked_registry_is_never_replaced_by_a_regular_file(tmp_path, monkeypatch):
+    reg = Reg(tmp_path, monkeypatch)
+    real = tmp_path / "rooms" / "registry.yaml"
+    real.write_text(REGISTRY, encoding="utf-8")
+    real.chmod(0o600)
+    (reg.ws / "registry.yaml").unlink()
+    os.symlink(real, reg.ws / "registry.yaml")
+    old = os.umask(0o022)
+    try:
+        for expect in (None, "0" * 64):
+            refused(*run_decline(reg, "~/src/tmp-*", expect=expect),
+                    scan.NOT_REGULAR % "registry.yaml")
+            refused(*run_register(reg, "~/src/new", expect=expect),
+                    scan.NOT_REGULAR % "registry.yaml")
+    finally:
+        os.umask(old)
+    assert os.readlink(reg.ws / "registry.yaml") == str(real)
+    assert real.read_text(encoding="utf-8") == REGISTRY
+    assert stat.S_IMODE(real.stat().st_mode) == 0o600
+
+
+def test_stored_evidence_is_the_real_path(tmp_path, monkeypatch):
+    reg = Reg(tmp_path, monkeypatch)
+    reg.put("new/lib\\helpers.py", "import shop_web\n")
+    registered(reg, "~/src/new")
+    drafted = [edge for edge in load(reg)["edges"] if edge["from"] == "new"]
+    assert drafted == [{"from": "new", "to": "shop-web", "kind": "source",
+                        "evidence": "lib\\helpers.py:1", "approved_at": TODAY}], drafted
+    path, line = drafted[0]["evidence"].rsplit(":", 1)
+    assert (reg.root / "new" / path).is_file()
+    buffer = io.StringIO()
+    code = scan.main(str(reg.ws), None, out=buffer, edges=True)
+    out = buffer.getvalue()
+    assert code == 0, out
+    assert "WARN   stale" not in out, out
