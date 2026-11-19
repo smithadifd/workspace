@@ -16,7 +16,6 @@ and both the node walk and the firmlink rule see it; elsewhere it does not
 exist and the firmlink rule alone refuses it.
 """
 import errno
-import io
 import json
 import os
 import subprocess
@@ -24,8 +23,8 @@ import sys
 
 import pytest
 
-from workspace import check, gen, overlap, scan
-from test_gen import WS, contents, generate, plan_hash, run
+from workspace import overlap
+from test_gen import WS, contents, generate, run
 from test_scan import REPO_ROOT
 
 DATA_VOLUME = "/System/Volumes/Data"
@@ -515,3 +514,68 @@ def test_a_clean_registry_with_real_folders_and_links_renders_unchanged(tmp_path
         "settings": {}}, indent=2) + "\n"
     code, out = run_check(ws.base, ws.path)
     assert code == 0, out
+
+
+# --------------------------------------------------------------------------
+# Parity with the retired generator's refusals (excluded ~/work and ~/rooms/**)
+# --------------------------------------------------------------------------
+
+def retired_layout(base, case):
+    if case == "through-excluded-link":
+        (base / "scratch" / "x").mkdir(parents=True)
+        (base / "work").symlink_to(base / "scratch")
+    elif case in ("links-out", "excluded-target-link"):
+        (base / "src" / "foo").mkdir(parents=True)
+        if case == "links-out":
+            (base / "work").mkdir()
+            (base / "work" / "link").symlink_to(base / "src" / "foo")
+        else:
+            (base / "scratch").mkdir()
+            (base / "work").symlink_to(base / "scratch")
+            (base / "scratch" / "link").symlink_to(base / "src" / "foo")
+
+
+@pytest.mark.parametrize("case, path, subpath", [
+    ("plain", "~/rooms/kitchen-table", None),
+    ("plain", "~/work/", None),
+    ("plain", "~/Rooms/private", None),
+    ("plain", "~/ROOMS/kt", None),
+    ("plain", "~/Work/x", None),
+    ("plain", "~/WORK", None),
+    ("plain", "~/src/beta", "../../work/copy"),
+    ("through-excluded-link", "~/scratch/x", None),
+    ("links-out", "~/work/link", None),
+    ("excluded-target-link", "~/scratch/link", None),
+])
+@pytest.mark.parametrize("shape", ["resolved", "linked"])
+def test_every_retired_refusal_is_refused(tmp_path, monkeypatch, shape, case, path, subpath):
+    ws = home_ws(tmp_path, monkeypatch, shape, excluded=[{"path": "~/work", "reason": "r"},
+                                                         ROOMS])
+    retired_layout(ws.base, case)
+    set_ingest(ws, path, subpath)
+    gen_refused(ws)
+
+
+@pytest.mark.parametrize("plain_work", [True, False])
+def test_a_name_prefix_of_an_excluded_folder_is_written(tmp_path, monkeypatch, plain_work):
+    ws = home_ws(tmp_path, monkeypatch, excluded=[{"path": "~/work", "reason": "r"}])
+    (ws.base / "workshop" / "x").mkdir(parents=True)
+    if plain_work:
+        (ws.base / "work").mkdir()
+    else:
+        (ws.base / "scratch").mkdir()
+        (ws.base / "work").symlink_to(ws.base / "scratch")
+    set_ingest(ws, "~/workshop/x")
+    code, out = run(ws)
+    assert code == 0, out
+
+
+def test_a_project_link_to_another_spelling_of_an_excluded_folders_parent_is_refused(stand_in):
+    # Retired k2(b): src/up-link -> the other spelling of ~/rooms, with
+    # ~/rooms/secret excluded: node(P) is the `..` of the excluded folder.
+    alias, ws, home = stand_in
+    up = os.path.join(home, "src", "up-link")
+    os.symlink(alias(home + "/rooms"), up)
+    ws.document["excluded"] = [{"path": "~/rooms/secret", "reason": "r"}]
+    set_ingest(ws, up)
+    gen_refused(ws)
