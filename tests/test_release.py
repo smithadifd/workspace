@@ -67,11 +67,11 @@ def test_release_config_and_manifest():
     assert set(manifest) <= {"."}
     for version in manifest.values():
         assert re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", version), version
-    if manifest:
-        # release-please reads the manifest as the last released version, so it
-        # must move with the package version or the next release repeats a tag.
-        pyproject = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
-        assert manifest["."] == pyproject["project"]["version"], manifest
+    # release-please reads the manifest as the last released version, so it
+    # must move with the package version or the next release repeats a tag.
+    # v0.1.0 is tagged, so an empty manifest is drift too.
+    pyproject = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    assert manifest == {".": pyproject["project"]["version"]}, manifest
 
 
 def test_release_workflow_is_main_only_pinned_and_least_privilege():
