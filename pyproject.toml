@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "workspace"
-version = "0.1.0-dev0"
+version = "0.1.0"
 description = "Read-only checks of a workspace registry against its map, its settings and the repos on disk, driven by one CLI."
 readme = "README.md"
 requires-python = ">=3.11"
