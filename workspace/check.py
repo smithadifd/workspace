@@ -12,10 +12,18 @@ prove:
 5. no project folder that is not archived, on any host, is, holds or sits
    inside an excluded folder under any spelling (`workspace.overlap`); a
    step it cannot stat is UNKNOWN
+6. a workspace `gen` has written (it holds `.workspace-gen.json`, or its map
+   carries the GENERATED header) still matches what `gen` would write from
+   the registry now: `AGENTS.md`, `CLAUDE.md`, `.claude/settings.json` and
+   `.workspace-gen.json` are each compared with the plan `gen` renders in
+   memory (`gen.make_plan`, never `--write`). `check` is not given a host, so
+   it leaves out the per-host files (`<host>.code-workspace`,
+   `state/gen-<host>.json`); the four it compares do not depend on the host.
 
 Opens the three inputs for reading only; to judge rule 5 it looks up (stats)
 each project folder and excluded folder, and the folders above them, and
-opens nothing there. No network. No writes.
+opens nothing there; for rule 6 it reads what `gen` reads. No network. No
+writes.
 
 Exit codes:
   0  CONFORMS
@@ -25,6 +33,7 @@ Exit codes:
 """
 from pathlib import Path
 import json
+import os
 import re
 import sys
 
@@ -344,6 +353,72 @@ def workspace_inputs(workspace_arg):
     )
 
 
+def plan_hosts(workspace_arg, document):
+    """(host to render the plan for, host to name in the fix) for `stale_generated`.
+
+    `check` is not given a host. The files it compares do not depend on one, so
+    any host in `code_roots` renders them the same; it prefers a host `gen`
+    has recorded (`state/gen-<host>.json`), so that host's own files are the
+    ones `make_plan` reads. The fix names the host only when there is one;
+    with several it says `<host>`, because only the person knows theirs.
+    """
+    from workspace import gen  # here, not at the top: gen imports this module
+
+    code_roots = document.get("code_roots")
+    hosts = sorted(h for h in code_roots if isinstance(h, str)) if isinstance(code_roots, dict) else []
+    if not hosts:
+        return None, "<host>"  # make_plan names what is wrong with code_roots
+    recorded = [
+        host
+        for host in hosts
+        if gen.HOST_FILE_NAME.match(host)
+        and os.path.isfile(os.path.join(workspace_arg, gen.STATE_DIR, "gen-%s.json" % host))
+    ]
+    return (recorded or hosts)[0], hosts[0] if len(hosts) == 1 else "<host>"
+
+
+def stale_generated(workspace_arg, document, map_text):
+    """Gaps for each generated file that differs from what `gen` would write now.
+
+    Renders the plan in memory (`gen.make_plan`, which writes nothing) and
+    compares it with the committed files, so a map restored from before a
+    registry change fails even when the manifest was restored with it, and a
+    hand-reverted line fails even when the manifest hash was changed to match.
+    A workspace `gen` never wrote (no manifest, no GENERATED header on the
+    map) has no generated files to compare and gives none.
+    """
+    from workspace import gen  # here, not at the top: gen imports this module
+
+    manifest_path = os.path.join(workspace_arg, gen.MANIFEST_NAME)
+    if not os.path.lexists(manifest_path) and not map_text.startswith(gen.HEADER_PREFIX):
+        return []
+    host, fix_host = plan_hosts(workspace_arg, document)
+    fix = "run `workspace gen %s --host %s`" % (workspace_arg, fix_host)
+    try:
+        plan = gen.make_plan(workspace_arg, host, False)
+    except gen.Refusal as refusal:
+        return [
+            "gen would refuse to render the generated files, so they cannot be "
+            "compared: %s" % reason
+            for reason in refusal.reasons
+        ]
+    except scan.Unverifiable:
+        raise
+    except Exception as exc:  # fail closed, as gen does: never pass on a crash
+        unknown("could not render the plan to compare: %s: %s" % (type(exc).__name__, exc))
+    stale = [
+        target.rel
+        for target in plan.targets
+        if target.kind != "code-workspace" and target.changes
+    ]
+    if plan.manifest_text != plan.manifest_data:
+        stale.append(gen.MANIFEST_NAME)
+    return [
+        "generated file `%s` is stale against registry.yaml; %s" % (rel, fix)
+        for rel in stale
+    ]
+
+
 def main(workspace_arg):
     sys.stdout.write("== check-workspace-registry ==\n")
 
@@ -387,6 +462,7 @@ def main(workspace_arg):
 
     try:
         gaps = check(document, map_text, settings)
+        gaps.extend(stale_generated(workspace_arg, document, map_text))
     except scan.Unverifiable as exc:
         unknown(str(exc))
     if gaps:
