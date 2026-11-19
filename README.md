@@ -211,6 +211,10 @@ its real path and by the folders above it that do exist. A folder or parent that
 cannot be looked up for any other reason (no permission, a symlink loop) is a
 could-not-verify: exit 2, nothing written. Code roots are not judged this way: an
 excluded folder inside a code root is the usual layout.
+`check` skips a project path that is null on a host, and a placeholder path
+written as `<...>` (the template's), while `gen` refuses both with exit 2; any
+other path that is neither absolute nor starts with `~` is a could-not-verify
+in `check` too.
 
 The code root itself is compared by its text. Write it as its real path, with
 no symlinked folder above it: `git` records a worktree's git folder by its real

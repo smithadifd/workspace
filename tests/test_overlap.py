@@ -535,6 +535,19 @@ def test_check_judges_a_placeholder_project_path_by_its_text_only(tmp_path):
     assert "UNKNOWN" not in out and "not an absolute path" not in out, out
 
 
+@pytest.mark.parametrize("text", ['"$HOME/private"', '"../home/private"', '" ~/private"',
+                                  '"private/x"'])
+def test_check_is_unknown_for_a_relative_project_path_that_is_not_a_placeholder(tmp_path,
+                                                                                text):
+    home, ws = check_ws(tmp_path)
+    set_check_path(ws, text)
+    code, out = run_check(home, ws)
+    assert code == 2, out
+    raw = text.strip('"')
+    assert "UNKNOWN  project `alpha` path `%s` is not an absolute path" % raw in out, out
+    assert "PASS" not in out, out
+
+
 def test_the_shipped_template_is_not_a_could_not_verify_for_the_rule():
     from workspace import check
     text = (REPO_ROOT / "docs" / "template" / "registry.yaml").read_text(encoding="utf-8")
