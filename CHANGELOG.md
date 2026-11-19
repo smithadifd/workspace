@@ -2,17 +2,6 @@
 
 ## 0.1.0 (2026-11-19)
 
-
-### Features
-
-* add gen, register, decline and scan --edges ([#2](https://github.com/smithadifd/workspace/issues/2)) ([05d6342](https://github.com/smithadifd/workspace/commit/05d63420820c8621c068d682bebefca04c85c926))
-* add the opt-in workspace prompt session-start line ([#3](https://github.com/smithadifd/workspace/issues/3)) ([ad62698](https://github.com/smithadifd/workspace/commit/ad626987bcffae6f9e24541f7ddd849c85d9a252))
-* add the workspace check and scan verbs ([#1](https://github.com/smithadifd/workspace/issues/1)) ([9ddb44c](https://github.com/smithadifd/workspace/commit/9ddb44c80ba761954bb26f37d7a1f988ca808944))
-
-## Changelog
-
-## Unreleased
-
 The first version: one command, `workspace`, with two read-only verbs and three that write only on a confirm.
 
 - **`workspace check WORKSPACE`** proves that a workspace's `registry.yaml`, its map and `.claude/settings.json` agree: every active project has its own map line, archived projects appear only on their cluster's compact line, and every excluded path has a Read and an Edit deny rule, plus a `sandbox.filesystem.denyRead` entry when the settings declare a `sandbox` block. Duplicate YAML keys are a gap; an unhashable key, a missing or unreadable input, or missing PyYAML is UNKNOWN (exit 2). The map is `AGENTS.md`, or `CLAUDE.md` when no `AGENTS.md` exists.
@@ -21,3 +10,9 @@ The first version: one command, `workspace`, with two read-only verbs and three 
 - CI runs both test suites on `ubuntu-latest`.
 - **`gen`, `register` and `decline`** are new verbs that print a plan and write only on `--write --expect <plan hash>`; `gen`'s output always passes `check` (absolute excluded paths are written as `//path/**`), and **`scan --edges`** proposes edges from files inside registered repositories, walked like every other scan path and never opening a `.env*` file.
 - **`gen` can add a SessionStart hook that runs `workspace prompt`**, off by default: with `session_prompt: on` at the top level of `registry.yaml`, `gen` adds one hook entry it owns, whose command is exactly `workspace prompt`, and removes only that entry once the key is gone or holds any other value; a SessionStart hook you wrote is never touched.
+
+### Features
+
+* add gen, register, decline and scan --edges ([#2](https://github.com/smithadifd/workspace/issues/2)) ([05d6342](https://github.com/smithadifd/workspace/commit/05d63420820c8621c068d682bebefca04c85c926))
+* add the opt-in workspace prompt session-start line ([#3](https://github.com/smithadifd/workspace/issues/3)) ([ad62698](https://github.com/smithadifd/workspace/commit/ad626987bcffae6f9e24541f7ddd849c85d9a252))
+* add the workspace check and scan verbs ([#1](https://github.com/smithadifd/workspace/issues/1)) ([9ddb44c](https://github.com/smithadifd/workspace/commit/9ddb44c80ba761954bb26f37d7a1f988ca808944))
