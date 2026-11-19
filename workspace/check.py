@@ -16,9 +16,10 @@ prove:
    carries the GENERATED header) still matches what `gen` would write from
    the registry now: `AGENTS.md`, `CLAUDE.md`, `.claude/settings.json` and
    `.workspace-gen.json` are each compared with the plan `gen` renders in
-   memory (`gen.make_plan`, never `--write`). `check` is not given a host, so
-   it leaves out the per-host files (`<host>.code-workspace`,
-   `state/gen-<host>.json`); the four it compares do not depend on the host.
+   memory (`gen.make_plan` with `shared_only`, never `--write`). `check` is
+   not given a host, so the plan holds only those shared files: the per-host
+   files (`<host>.code-workspace`, `state/gen-<host>.json`) are neither
+   rendered nor read, and an edit to one cannot change the verdict.
 
 Opens the three inputs for reading only; to judge rule 5 it looks up (stats)
 each project folder and excluded folder, and the folders above them, and
@@ -353,28 +354,18 @@ def workspace_inputs(workspace_arg):
     )
 
 
-def plan_hosts(workspace_arg, document):
-    """(host to render the plan for, host to name in the fix) for `stale_generated`.
+def fix_host(document):
+    """The host to name in the fix line: the one `code_roots` host, else `<host>`.
 
-    `check` is not given a host. The files it compares do not depend on one, so
-    any host in `code_roots` renders them the same; it prefers a host `gen`
-    has recorded (`state/gen-<host>.json`), so that host's own files are the
-    ones `make_plan` reads. The fix names the host only when there is one;
-    with several it says `<host>`, because only the person knows theirs.
+    `check` is not given a host and needs none (the plan is `shared_only`), so
+    with several hosts only the person knows theirs.
     """
-    from workspace import gen  # here, not at the top: gen imports this module
-
     code_roots = document.get("code_roots")
-    hosts = sorted(h for h in code_roots if isinstance(h, str)) if isinstance(code_roots, dict) else []
-    if not hosts:
-        return None, "<host>"  # make_plan names what is wrong with code_roots
-    recorded = [
-        host
-        for host in hosts
-        if gen.HOST_FILE_NAME.match(host)
-        and os.path.isfile(os.path.join(workspace_arg, gen.STATE_DIR, "gen-%s.json" % host))
-    ]
-    return (recorded or hosts)[0], hosts[0] if len(hosts) == 1 else "<host>"
+    if isinstance(code_roots, dict) and len(code_roots) == 1:
+        (host,) = code_roots
+        if isinstance(host, str):
+            return host
+    return "<host>"
 
 
 def stale_generated(workspace_arg, document, map_text):
@@ -392,10 +383,10 @@ def stale_generated(workspace_arg, document, map_text):
     manifest_path = os.path.join(workspace_arg, gen.MANIFEST_NAME)
     if not os.path.lexists(manifest_path) and not map_text.startswith(gen.HEADER_PREFIX):
         return []
-    host, fix_host = plan_hosts(workspace_arg, document)
-    fix = "run `workspace gen %s --host %s`" % (workspace_arg, fix_host)
+    fix = "run `workspace gen %s --host %s`" % (workspace_arg, fix_host(document))
     try:
-        plan = gen.make_plan(workspace_arg, host, False)
+        # shared_only: no host, and no per-host file is rendered, read or validated.
+        plan = gen.make_plan(workspace_arg, None, False, shared_only=True)
     except gen.Refusal as refusal:
         return [
             "gen would refuse to render the generated files, so they cannot be "
@@ -406,11 +397,7 @@ def stale_generated(workspace_arg, document, map_text):
         raise
     except Exception as exc:  # fail closed, as gen does: never pass on a crash
         unknown("could not render the plan to compare: %s: %s" % (type(exc).__name__, exc))
-    stale = [
-        target.rel
-        for target in plan.targets
-        if target.kind != "code-workspace" and target.changes
-    ]
+    stale = [target.rel for target in plan.targets if target.changes]
     if plan.manifest_text != plan.manifest_data:
         stale.append(gen.MANIFEST_NAME)
     return [
