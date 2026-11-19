@@ -40,7 +40,11 @@ is off unless you turn it on, writes only its own state file:
   `sandbox` block, it also checks that every excluded path is in
   `sandbox.filesystem.denyRead`. It also checks that no project folder
   reaches an excluded folder, as described under "What it does on your
-  machine".
+  machine". In a workspace `gen` has written, it also renders the plan in
+  memory and fails when `AGENTS.md`, `CLAUDE.md`, `.claude/settings.json` or
+  `.workspace-gen.json` differs from it (a stale map), naming each file and
+  telling you to run `workspace gen WORKSPACE --host HOST`. It compares only
+  the files that do not depend on a host, and writes nothing.
 - `workspace scan WORKSPACE` lists this host's code root one level deep and
   reports what the registry does not account for: repositories it does not name
   and has not declined, registered repositories missing on this host, and
