@@ -497,6 +497,58 @@ def test_check_reports_a_step_it_cannot_stat_as_unknown(tmp_path):
     assert "UNKNOWN  cannot stat %s" % (home / "src" / "alpha") in out, out
 
 
+TEMPLATE_PATH = "<absolute or ~/ project path>"
+
+
+def set_check_path(ws, text):
+    """The conforming fixture with alpha's laptop path written as `text`."""
+    registry = ws / "registry.yaml"
+    before = registry.read_text(encoding="utf-8")
+    after = before.replace("paths: {laptop: ~/src/alpha}", "paths: {laptop: %s}" % text)
+    assert after != before
+    registry.write_text(after, encoding="utf-8")
+
+
+def test_check_does_not_judge_a_null_project_path(tmp_path):
+    # A null path names no folder on that host (project_folder returns None),
+    # so the rule skips it; check runs no grammar validation and passes.
+    home, ws = check_ws(tmp_path)
+    set_check_path(ws, "null")
+    code, out = run_check(home, ws)
+    assert code == 0, out
+    assert "Traceback" not in out and "TypeError" not in out, out
+    assert "PASS  registry, map, and settings are consistent" in out, out
+
+
+def test_gen_still_refuses_a_null_project_path(tmp_path, monkeypatch):
+    ws = home_ws(tmp_path, monkeypatch)
+    set_ingest(ws, None)
+    out = gen_unknown(ws)
+    assert "path for host `desk` must be a non-empty string" in out, out
+
+
+def test_check_judges_a_placeholder_project_path_by_its_text_only(tmp_path):
+    home, ws = check_ws(tmp_path)
+    set_check_path(ws, '"%s"' % TEMPLATE_PATH)
+    code, out = run_check(home, ws)
+    assert code == 0, out
+    assert "UNKNOWN" not in out and "not an absolute path" not in out, out
+
+
+def test_the_shipped_template_is_not_a_could_not_verify_for_the_rule():
+    from workspace import check
+    text = (REPO_ROOT / "docs" / "template" / "registry.yaml").read_text(encoding="utf-8")
+    assert TEMPLATE_PATH in text
+    assert overlap.excluded_overlaps(check.load_registry_yaml(text)) == []
+
+
+def test_gen_still_refuses_a_placeholder_project_path(tmp_path, monkeypatch):
+    ws = home_ws(tmp_path, monkeypatch)
+    set_ingest(ws, TEMPLATE_PATH)
+    out = gen_unknown(ws)
+    assert "project `ingest` path `%s` is not an absolute path" % TEMPLATE_PATH in out, out
+
+
 # --------------------------------------------------------------------------
 # Bar 8: a clean registry renders as before
 # --------------------------------------------------------------------------
