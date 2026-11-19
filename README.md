@@ -38,7 +38,9 @@ is off unless you turn it on, writes only its own state file:
   archived projects appear only on their cluster's compact line, and every
   excluded path has a Read and an Edit deny rule. When the settings declare a
   `sandbox` block, it also checks that every excluded path is in
-  `sandbox.filesystem.denyRead`.
+  `sandbox.filesystem.denyRead`. It also checks that no project folder
+  reaches an excluded folder, as described under "What it does on your
+  machine".
 - `workspace scan WORKSPACE` lists this host's code root one level deep and
   reports what the registry does not account for: repositories it does not name
   and has not declined, registered repositories missing on this host, and
@@ -189,6 +191,27 @@ folder whose real name holds a glob character, such as `[priv]`, is covered by
 its text and by its identity. Any other entry that a glob character other than
 the trailing `/*` or `/**` matches is matched by its text only.
 
+**A project folder never reaches an excluded folder.** `gen` refuses, with exit
+1 and nothing written, and `check` reports as a gap, a registry in which a
+project that is not archived has a folder, on any host, that is an excluded
+folder, holds one, or sits inside one. The folder is the project's path with
+`~` expanded and its `subpath` joined, the same folder `gen` writes to the
+`.code-workspace` file, so a `subpath` such as `../../rooms/x` is judged as the
+folder it reaches. An excluded entry is judged as its folder, with a trailing
+`/**`, `/*` or `/` dropped. The two are compared by identity, both ways: by
+real path (symlinks resolved, a dangling symlink by the text of its target),
+compared with letter case and Unicode composition folded and with a leading
+`/System/Volumes/Data` (the macOS firmlink spelling) dropped; and by device and
+inode, of the folder and of every parent folder the system reaches from it with
+`..`. So a symlink such as `~/code/room-link` pointing into `~/rooms/private`, a
+project folder that holds an excluded folder, another letter case, a firmlink, a
+bind mount or volfs spelling of the same folder are all refused. A folder that
+does not exist on this host is not refused for that alone; it is still judged by
+its real path and by the folders above it that do exist. A folder or parent that
+cannot be looked up for any other reason (no permission, a symlink loop) is a
+could-not-verify: exit 2, nothing written. Code roots are not judged this way: an
+excluded folder inside a code root is the usual layout.
+
 The code root itself is compared by its text. Write it as its real path, with
 no symlinked folder above it: `git` records a worktree's git folder by its real
 path, and a worktree whose git folder does not sit under the code root as
@@ -264,6 +287,9 @@ These are not covered:
   checked for staleness; such edges are counted on one `INFO` line.
 - A source file with more than one hard link, or larger than 400,000 bytes, is
   not read for edges.
+- A project folder is compared with the excluded folders when `gen` or `check`
+  runs; a symlink changed afterwards is not seen. A hard link to a file inside
+  an excluded folder has no parent folder to compare, so it is not recognised.
 - `gen`'s check that the map imports nothing inside a registered repository
   compares paths by their text, so an `@` import through a symlinked folder into
   a registered repository is not recognised.
