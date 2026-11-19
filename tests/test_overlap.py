@@ -536,7 +536,7 @@ def test_check_judges_a_placeholder_project_path_by_its_text_only(tmp_path):
 
 
 @pytest.mark.parametrize("text", ['"$HOME/private"', '"../home/private"', '" ~/private"',
-                                  '"private/x"'])
+                                  '"private/x"', '"<private/x"', '"private/x>"'])
 def test_check_is_unknown_for_a_relative_project_path_that_is_not_a_placeholder(tmp_path,
                                                                                 text):
     home, ws = check_ws(tmp_path)
