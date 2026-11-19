@@ -196,11 +196,23 @@ def excluded_entries(document):
     return entries
 
 
+def is_placeholder(text):
+    """True for a placeholder project path such as `<absolute or ~/ project path>`."""
+    return isinstance(text, str) and text.startswith("<") and text.endswith(">")
+
+
 def excluded_overlaps(document):
     """One reason per project folder, on any host, that reaches an excluded folder.
 
-    Archived projects are left out. Raises `scan.Unverifiable` when a step
-    cannot be judged.
+    Archived projects are left out. A host whose path is null names no folder
+    there (`project_folder` returns None), so it is not judged; `gen` refuses
+    a null path before this rule runs (`scan.validate`). A placeholder path,
+    text that starts with `<` and ends with `>` (such as
+    `<absolute or ~/ project path>` in the shipped template), names no folder
+    on disk either, so it is not judged: `gen` refuses it with exit 2 before
+    this rule runs (`path_gate`). Any other path that is neither absolute nor
+    starts with `~` is a could-not-verify, as is an empty one. Raises
+    `scan.Unverifiable` when a step cannot be judged.
     """
     reasons = []
     excluded = None
@@ -210,8 +222,12 @@ def excluded_overlaps(document):
         paths = project.get("paths") or {}
         if not isinstance(paths, dict):
             continue
-        for host in paths:
+        for host, text in paths.items():
+            if is_placeholder(text):
+                continue
             folder = project_folder(project, host)
+            if folder is None:
+                continue
             if excluded is None:
                 excluded = excluded_entries(document)
             own = Side(folder)
