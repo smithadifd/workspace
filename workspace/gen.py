@@ -8,7 +8,10 @@ From `registry.yaml`, `gen` renders, in the workspace folder:
 - `.claude/settings.json`, where it owns only the code roots in
   `permissions.additionalDirectories` and a Read and an Edit deny rule for every
   excluded path (and, when the person declared a `sandbox` block, each excluded
-  path in `sandbox.filesystem.denyRead`); every other key passes through;
+  path in `sandbox.filesystem.denyRead`), and, only while `registry.yaml` says
+  `session_prompt: on`, one `hooks.SessionStart` entry that runs the constant
+  command `workspace prompt` (see `HOOK_COMMAND`); every other key, and every
+  hook it did not add, passes through;
 - `<host>.code-workspace`, the host's folders for an editor;
 - `.workspace-gen.json` and `state/gen-<host>.json`, its own manifests.
 
@@ -88,6 +91,19 @@ KEEP_MARKER = re.compile(r"^<!-- workspace:keep (begin|end) (\S+) -->$")
 HOST_FILE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 GLOB_CHARACTERS = "*?["
 MANIFEST_VERSION = 1
+
+# The SessionStart prompt hook. gen owns at most this one entry in
+# `hooks.SessionStart`: a constant command with no path or registry text in
+# it, which Claude Code runs from the workspace folder. The manifest records
+# it by its command under HOOK_KEY in the settings' `owned` record, and only
+# while gen owns it, so a manifest written before the hook existed reads the
+# same. gen adds the entry only while the registry says `session_prompt: on`
+# (`scan.session_prompt`); when that is off it removes one entry equal to it,
+# and only when the manifest records gen owning it. A hook gen did not add is
+# never touched, even one that runs the same command.
+HOOK_EVENT = "SessionStart"
+HOOK_COMMAND = "workspace prompt"
+HOOK_KEY = "hooks.SessionStart"
 
 CLOEXEC = getattr(os, "O_CLOEXEC", 0)
 WORKSPACE_FLAGS = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | CLOEXEC
@@ -650,6 +666,76 @@ def settings_lists(settings, create):
     return lists
 
 
+def hook_entry():
+    """The one SessionStart entry gen may own."""
+    return {"hooks": [{"type": "command", "command": HOOK_COMMAND}]}
+
+
+def hook_list(settings, create):
+    """`hooks.SessionStart` in the settings; None when absent and not `create`.
+
+    It refuses a shape gen cannot merge into. gen calls it only when it must
+    add or remove its own entry, so a hooks block gen has no part in is never
+    judged and passes through as it is.
+    """
+    hooks = settings.get("hooks")
+    if hooks is None:
+        if not create:
+            return None
+        hooks = settings["hooks"] = {}
+    if not isinstance(hooks, dict):
+        raise Refusal("settings.json `hooks` is not an object; gen cannot merge into it")
+    events = hooks.get(HOOK_EVENT)
+    if events is None:
+        if not create:
+            return None
+        events = hooks[HOOK_EVENT] = []
+    if not isinstance(events, list):
+        raise Refusal("settings.json `hooks.%s` is not a list; gen cannot merge into it"
+                      % HOOK_EVENT)
+    return events
+
+
+def hook_present(settings, owned):
+    """[HOOK_COMMAND] when gen owns its entry and the settings hold it, else []."""
+    if HOOK_COMMAND not in (owned.get(HOOK_KEY) or []):
+        return []
+    try:
+        events = hook_list(settings, create=False)
+    except Refusal:
+        return []
+    return [HOOK_COMMAND] if events is not None and hook_entry() in events else []
+
+
+def merge_hook(merged, wanted, owned, adopting):
+    """Add or remove gen's one SessionStart entry in `merged`; return what gen owns after.
+
+    On: add the entry when no equal entry is there. An equal entry already
+    there is gen's only when the manifest records it, or when adopting. Off:
+    remove one equal entry, only when the manifest records gen owning it; a
+    `SessionStart` list or `hooks` object that removal leaves empty goes too.
+    Nothing else in `hooks` is changed.
+    """
+    owns = HOOK_COMMAND in owned
+    entry = hook_entry()
+    if wanted:
+        events = hook_list(merged, create=False)
+        if events is not None and entry in events:
+            return [HOOK_COMMAND] if owns or adopting else []
+        hook_list(merged, create=True).append(entry)
+        return [HOOK_COMMAND]
+    if not owns:
+        return []
+    events = hook_list(merged, create=False)
+    if events is not None and entry in events:
+        events.remove(entry)
+        if not events:
+            del merged["hooks"][HOOK_EVENT]
+            if not merged["hooks"]:
+                del merged["hooks"]
+    return []
+
+
 def ensure_list(settings, key):
     if key == "denyRead":
         filesystem = settings["sandbox"].setdefault("filesystem", {})
@@ -657,15 +743,17 @@ def ensure_list(settings, key):
     return settings.setdefault("permissions", {}).setdefault(key, [])
 
 
-def merge_settings(existing, code_roots, excluded, owned, adopting):
+def merge_settings(existing, code_roots, excluded, owned, adopting, session_prompt=False):
     """Merge gen's entries into the settings; return (merged, owned after the merge).
 
     `owned` is what the manifest records gen owns. When `adopting`, every
     existing entry that covers a registry path is recorded as gen-owned too.
+    `session_prompt` is whether the registry turns the SessionStart hook on.
     """
     merged = copy.deepcopy(existing)
     lists = settings_lists(merged, create=False)
     sandbox_declared = "sandbox" in merged
+    hook_owned = list(owned.get(HOOK_KEY) or [])
     owned = {key: list(owned.get(key, [])) for key in empty_owned()}
     roots = code_root_texts(code_roots)
     covering = set()
@@ -706,7 +794,11 @@ def merge_settings(existing, code_roots, excluded, owned, adopting):
             current = merged["sandbox"].get("filesystem", {}).get("denyRead") or []
             if not check.denyread_covers(current, path):
                 add("denyRead", path)
-    return merged, {key: sorted(value) for key, value in owned.items()}
+    result = {key: sorted(value) for key, value in owned.items()}
+    hook_owned = merge_hook(merged, session_prompt, hook_owned, adopting)
+    if hook_owned:
+        result[HOOK_KEY] = hook_owned
+    return merged, result
 
 
 def settings_view(settings, owned):
@@ -721,12 +813,14 @@ def settings_view(settings, owned):
     for key in empty_owned():
         current = lists.get(key) or []
         view[key] = sorted(item for item in owned.get(key, []) if item in current)
+    if owned.get(HOOK_KEY):  # absent unless gen owns the hook, so older records hash the same
+        view[HOOK_KEY] = hook_present(settings, owned)
     return json.dumps(view, sort_keys=True)
 
 
 def settings_plan_lines(before, after):
     lines = []
-    for key in empty_owned():
+    for key in list(empty_owned()) + [HOOK_KEY]:
         old = before.get(key, [])
         new = after.get(key, [])
         for item in old:
@@ -842,10 +936,10 @@ def judge(target, entry, adopt, keep_source, keep_marked):
     if target.kind == "settings":
         missing = []
         current = json.loads(target.current.decode("utf-8"))
-        lists = settings_lists(current, create=False)
+        present = owned_view_lists(current, entry.get("owned") or {})
         for key, items in (entry.get("owned") or {}).items():
             for item in items:
-                if item not in (lists.get(key) or []):
+                if item not in present.get(key, []):
                     missing.append("%s %s" % (key, item))
         if missing:
             detail = "\ngen-owned entries removed by hand: " + ", ".join(missing)
@@ -891,7 +985,9 @@ def read_manifest(workspace, rel):
 
 def make_plan(workspace, host_flag, adopt):
     plan = Plan()
-    document = scan.load_registry(workspace)
+    registry = scan.registry_snapshot(workspace)
+    document = scan.parse_registry(registry.data)
+    session_prompt, session_note = scan.session_prompt(registry.data)
     code_roots, excluded, _, _ = scan.validate(document)
     host = scan.select_host(code_roots, host_flag)
     plan.host = host
@@ -939,7 +1035,8 @@ def make_plan(workspace, host_flag, adopt):
     entry = files.get(SETTINGS_REL)
     owned_before = (entry or {}).get("owned") or empty_owned()
     adopting = adopt or entry is None
-    merged, owned_after = merge_settings(existing, code_roots, excluded, owned_before, adopting)
+    merged, owned_after = merge_settings(existing, code_roots, excluded, owned_before, adopting,
+                                         session_prompt)
     if settings_data is not None and merged == existing:
         settings_render = settings_data
     else:
@@ -1011,7 +1108,7 @@ def make_plan(workspace, host_flag, adopt):
     planned[state_rel] = plan.state_text
     plan.digest = plan_digest("gen", [("host", host_flag), ("adopt", bool(adopt))], planned)
 
-    lines = []
+    lines = [] if session_note is None else ["note   %s" % session_note]
     for target in plan.targets:
         if not target.changes:
             lines.append("same   %s" % target.rel)
@@ -1035,8 +1132,10 @@ def make_plan(workspace, host_flag, adopt):
 
 def owned_view_lists(settings, owned):
     lists = settings_lists(copy.deepcopy(settings), create=False)
-    return {key: [item for item in (lists.get(key) or []) if item in owned.get(key, [])]
+    view = {key: [item for item in (lists.get(key) or []) if item in owned.get(key, [])]
             for key in empty_owned()}
+    view[HOOK_KEY] = hook_present(settings, owned)
+    return view
 
 
 # --------------------------------------------------------------------------

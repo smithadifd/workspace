@@ -28,9 +28,10 @@ gets read access it should not have. `workspace` makes those gaps visible.
 
 ## What this is
 
-One Python package and one command with five verbs. `check` and `scan` only
+One Python package and one command with six verbs. `check` and `scan` only
 read; `gen`, `register` and `decline` print a plan and a plan hash, and write
-only when you run them again with `--write --expect <hash>`:
+only when you run them again with `--write --expect <hash>`; `prompt`, which
+is off unless you turn it on, writes only its own state file:
 
 - `workspace check WORKSPACE` proves that the registry, the map and
   `.claude/settings.json` agree: every active project has its own map line,
@@ -48,12 +49,16 @@ only when you run them again with `--write --expect <hash>`:
 - `workspace gen WORKSPACE` renders the map (`AGENTS.md`), the `CLAUDE.md`
   pointer, the code roots and deny rules in `.claude/settings.json`, and this
   host's `.code-workspace` file from the registry. What it writes always passes
-  `check`.
+  `check`. When the registry says `session_prompt: on`, it also adds a
+  SessionStart hook that runs `workspace prompt`.
 - `workspace register WORKSPACE PATH --cluster ID --one-liner TEXT` adds the
   repository at PATH to the registry, with the edges found between it and the
   registered repositories.
 - `workspace decline WORKSPACE PATTERN --reason TEXT` records a remote or path
   pattern the registry should not propose again.
+- `workspace prompt`, run by that hook from the workspace folder, prints at
+  most one line when the code root holds repositories the registry does not
+  know yet (see [The session prompt](#the-session-prompt-optional-off-by-default)).
 
 It needs Python 3.11 or newer and PyYAML, its one dependency. It does not
 depend on any agent runtime: the registry and the map are plain files, and any
@@ -69,7 +74,7 @@ A workspace folder holds three files:
 |------|------------|
 | `registry.yaml` | The machine-readable list: code roots per host, excluded paths, clusters, projects (identity is the git remote; paths are recorded per host), edges between projects, and the repositories and edges you declined. |
 | `AGENTS.md` | The map an agent reads: one line per project, with the projects it uses (its outgoing edges) as `uses:` on that line. `CLAUDE.md` is a one-line shim (`@AGENTS.md`) so Claude Code loads the same map. A workspace whose hand-kept map is still in `CLAUDE.md` works too: `check` reads `AGENTS.md` when it exists and `CLAUDE.md` otherwise. |
-| `.claude/settings.json` | Claude Code's settings: the code roots as additional directories, and a Read and an Edit deny rule for every excluded path. |
+| `.claude/settings.json` | Claude Code's settings: the code roots as additional directories, a Read and an Edit deny rule for every excluded path, and, only if you turn it on, one SessionStart hook that runs `workspace prompt`. |
 
 To start a workspace, copy [`docs/template/registry.yaml`](docs/template/registry.yaml),
 fill it in, and run `workspace gen` (see [`docs/template/README.md`](docs/template/README.md)).
@@ -219,9 +224,11 @@ printable escaped.
 In `.claude/settings.json`, `gen` owns only the code roots in
 `permissions.additionalDirectories`, a Read and an Edit deny rule for each
 excluded path, and, when you have declared a `sandbox` block yourself, each
-excluded path in `sandbox.filesystem.denyRead`. It never writes a `sandbox`
-block, and every other key and rule passes through. It removes only rules its
-manifest records it owning, once their path leaves the registry. Another agent
+excluded path in `sandbox.filesystem.denyRead`; and, while the registry says
+`session_prompt: on`, one entry in `hooks.SessionStart` whose command is
+exactly `workspace prompt`. It never writes a `sandbox` block, and every other
+key, rule and hook passes through. It removes only entries its manifest
+records it owning, once their source leaves the registry. Another agent
 reads `AGENTS.md` but does not get these deny rules: only Claude Code enforces
 them.
 
@@ -364,6 +371,51 @@ the summary's `warn` figure:
 project with the same folder name, a `-`/`_` variant or a near spelling,
 suggesting `confused_with`. After `register --write` or `decline --write`, run
 `workspace gen` to update the map.
+
+### The session prompt (optional, off by default)
+
+`workspace prompt` tells you, when a Claude Code session starts in the
+workspace, that the code root holds repositories the registry does not know
+yet. It is off by default, and `gen` offers it only through this one setting.
+When it has something to say, it prints one line, such as:
+
+```text
+3 unregistered repos (newest: new-tool). Say 'register new-tool' or 'decline new-tool'
+```
+
+To turn it on, add this line at the top level of `registry.yaml`, then run
+`workspace gen` and confirm its plan with `--write --expect HASH`:
+
+```yaml
+session_prompt: on
+```
+
+`gen` then adds one entry to `hooks.SessionStart` in `.claude/settings.json`,
+whose command is exactly `workspace prompt`, with no path or registry text in
+it. Claude Code runs it from the workspace folder, so `workspace` must be on
+your `PATH`. Only the value `on` turns it on (quoted or not); any other value,
+`On`, `true` and `yes` included, leaves it off, and `gen`'s plan says so on a
+`note` line. To turn it off, remove the line, or set it to anything else, and
+run `gen` again: it removes the entry it added and nothing else. A
+SessionStart hook you wrote yourself is never changed or removed, even one that
+runs the same command, and `gen` does not add a second copy beside it.
+
+What `prompt` does:
+
+- It prints at most one line. It counts the repositories in this host's code
+  root that the registry neither names nor declines, and names the most
+  recently active one. A name that is not plain letters, digits, `.`, `_` and
+  `-`, up to 64 characters, is left out of the line rather than printed,
+  because what a SessionStart hook prints becomes part of the session's
+  context.
+- It shows that line at most once a day, and not while it is snoozed. When this
+  host's code root cannot be read, it prints one self-check line saying so
+  instead.
+- It never fails a session start: it exits 0 and writes nothing to standard
+  error, and on any problem it prints nothing. Its only state is
+  `state/prompt-<host>.json` in the workspace, written the way `gen` writes its
+  files, and it prints its line only after that state is saved. Keep `state/`
+  in the workspace's `.gitignore`.
 
 A repository counts as registered when its remote matches a project's `remote`
 (after normalising `https://`, `ssh://` and `user@host:` forms and a trailing
