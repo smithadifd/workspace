@@ -1,4 +1,4 @@
 """Workspace tooling: read-only checks of a workspace registry against its map,
 its settings and the repos on disk."""
 
-__version__ = "0.1.3"  # x-release-please-version
+__version__ = "0.1.4"  # x-release-please-version
