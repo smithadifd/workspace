@@ -10,7 +10,7 @@ Say which verb is affected, what you ran, and what happened. The output, the exi
 
 `check` and `scan` promise to read only: they write nothing and open no network connection. `scan` also promises never to list, open or inspect a path the registry excludes, anything outside the host's code root, or anything inside a registered repository beyond its `.git` marker. A report that either verb writes a file, reaches an excluded path or the outside of the code root (through a symlink, a worktree's git dir or otherwise), reads a file inside a repository, or reports a state it could not verify as a pass is in scope.
 
-`git` reads a repository's own config when `scan` asks it for the remote, and follows that config's include directives; a repository's config is trusted as far as `git` trusts it.
+`scan` never runs `git` on a repository. To read a repository's remote it hands `git` only the bytes of that repository's `config` file on standard input, with includes and the system and global config switched off. A config with an `[include]` or `[includeIf]` key ends the scan with exit 2 as could-not-verify, and the file it names is never opened. A report that `scan` follows an include, or reads a file one names, is in scope.
 
 ## Supported versions
 
