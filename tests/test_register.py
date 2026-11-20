@@ -316,14 +316,18 @@ def test_path_outside_the_code_root_is_refused(tmp_path, monkeypatch):
             "path ~/elsewhere/x, which is outside the code root; not read")
 
 
-def test_path_under_an_excluded_glob_is_refused_before_anything_is_read(tmp_path, monkeypatch):
+def test_path_under_an_excluded_glob_is_unknown_before_anything_is_read(tmp_path, monkeypatch):
+    # `~/src/priv-*` is a pattern, not an excluded path: the registry is refused.
     text = REGISTRY.replace("  - path: ~/rooms\n", "  - path: ~/src/priv-*\n    reason: r\n"
                             "  - path: ~/rooms\n")
     reg = Reg(tmp_path, monkeypatch, text)
     make_repo(reg.root / "priv-repo", REMOTE % "priv-repo")
+    before = reg.text()
     trace, (code, out) = traced(monkeypatch, lambda: run_register(reg, "~/src/priv-repo"))
-    refused(code, out, "path ~/src/priv-repo, which is excluded; not read")
-    assert trace.beneath(reg.root / "priv-repo") == []
+    assert code == 2, out
+    assert "UNKNOWN  " + scan.EXCLUDED_GLOB % "~/src/priv-*" in out.splitlines(), out
+    assert trace.under(reg.root / "priv-repo") == [], trace.under(reg.root / "priv-repo")
+    assert reg.text() == before
 
 
 def test_symlink_into_an_excluded_repo_is_refused_and_not_followed(tmp_path, monkeypatch):

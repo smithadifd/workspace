@@ -33,11 +33,11 @@ Every path is walked hop by hop from the code root, as the kernel would walk
 it: each hop is judged by its text, then lstat'd and judged by its node
 identity, so an excluded folder is recognised under any spelling that reaches
 it (another letter case on a case-insensitive disk, a symlinked parent). An
-exclusion's text matches as a literal path as well as a glob, so a real name
-that holds a glob character is covered, and the entry its literal text names is
-lstat'd for its identity whatever characters it holds. A
-parent step pops a verified hop and never rises above the code root. A symlink
-or a missing hop is refused.
+excluded entry names one literal path, never a pattern: an entry that still
+holds `*`, `?` or `[` once one trailing `/**` or `/*` and every trailing `/`
+are dropped is a could-not-verify (`exclusion_pattern`), so the walk never
+starts. A parent step pops a verified hop and never rises above the code root.
+A symlink or a missing hop is refused.
 
 scan reads a repo's git files itself: the `.git` file, `commondir` and the
 common `config`, each through one reader that opens it without following a
@@ -140,6 +140,15 @@ REMOTE_EMPTY = "%s: remote.origin.url is empty in %s; could not verify"
 REMOTE_MANY = "%s: remote.origin.url is set %d times in %s; could not verify"
 GIT_ODD_OUTPUT = "git gave unexpected output on %s (%s); could not verify"
 
+# An excluded entry names one literal path. What is left of it once one
+# trailing `/**` or `/*` and every trailing `/` are dropped must hold none of
+# these; the entry is named as written.
+GLOB_CHARACTERS = "*?["
+EXCLUDED_GLOB = ("excluded path `%s` holds a glob character (`*`, `?` or `[`); an excluded "
+                 "entry names one folder, never a pattern: list each folder on its own "
+                 "(rename one whose name holds such a character), or exclude the folder "
+                 "above it")
+
 # Why a walk stopped at a hop that is not judged by the scope.
 HOP_LINK = "link"
 HOP_MISSING = "missing"
@@ -201,31 +210,35 @@ def expand_path(text, what):
 
 
 def exclusion_pattern(text):
-    """An excluded path as the folder it covers, with everything beneath it.
+    """An excluded entry as the one literal path it names, which covers everything beneath it.
 
-    The bare folder and its glob forms `folder/*` and `folder/**` all mean the
-    folder itself and everything under it: `is_excluded` matches a path whose
-    ancestor matches the pattern.
+    The bare folder and its forms `folder/`, `folder/*` and `folder/**` all
+    name the folder itself: one trailing `/**` or `/*` is dropped, then every
+    trailing `/`. What is left is judged by its text as written, before `~`
+    expands and with no file system call: when it still holds `*`, `?` or `[`
+    the entry is a pattern, not a path, and it is a could-not-verify, whatever
+    exists on this host. A `]` alone is literal. This is the one place an
+    excluded entry becomes a path, for scan's walk, gen's gates and the
+    identity rule (`workspace.overlap`), so none of them ever reads a pattern.
     """
+    remainder = text
     for suffix in ("/**", "/*"):
-        if text.endswith(suffix):
-            text = text[:-len(suffix)]
+        if remainder.endswith(suffix):
+            remainder = remainder[:-len(suffix)]
             break
-    return expand_path(text.rstrip("/") or "/", "excluded path")
+    remainder = remainder.rstrip("/") or "/"
+    if any(character in remainder for character in GLOB_CHARACTERS):
+        raise Unverifiable(EXCLUDED_GLOB % text)
+    return expand_path(remainder, "excluded path")
 
 
-def is_excluded(path, patterns):
-    """True when `path` is an excluded pattern or beneath one, by text only.
+def is_excluded(path, exclusions):
+    """True when `path` is an excluded path or beneath one, by text only.
 
-    A pattern matches as its literal text (the path itself, or a folder above
-    it), so a real name that holds a glob character such as `[priv]` is
-    covered; and as a glob, against the path and every folder above it.
+    Each exclusion is one literal path (`exclusion_pattern`): it covers the
+    path itself and everything beneath it, and is never matched as a glob.
     """
-    return any(
-        within(path, pattern)
-        or any(fnmatch.fnmatchcase(candidate, pattern) for candidate in ancestors(path))
-        for pattern in patterns
-    )
+    return any(within(path, exclusion) for exclusion in exclusions)
 
 
 def split_text(text):
@@ -267,10 +280,9 @@ def excluded_nodes(patterns):
     """The node identity of each excluded entry that exists.
 
     Each entry itself is lstat'd, never anything beneath it, so a hop that
-    reaches it under another spelling is still recognised. The literal text of
-    every pattern is lstat'd whatever characters it holds, so a real name with
-    a glob character is recognised too; any other entry a glob matches is
-    matched by its text only.
+    reaches it under another spelling is still recognised. Every entry is the
+    one literal path `exclusion_pattern` returned; an entry that holds a glob
+    character never gets here.
     """
     nodes = set()
     for pattern in patterns:

@@ -3,7 +3,7 @@
 A project folder that is not archived, on any host, must not be an excluded
 folder, hold one, or sit inside one, under any spelling: a symlink, a case or
 Unicode variant, a subpath, a dangling symlink, or a spelling realpath leaves
-alone but the kernel reaches (a macOS firmlink, a bind mount, volfs). `gen`
+alone but the kernel reaches (a macOS firmlink, volfs). `gen`
 refuses such a registry with exit 1 and writes nothing; `check` reports it as
 a gap. A step that cannot be stat'd for a reason other than "does not exist"
 is a could-not-verify (exit 2).
@@ -16,15 +16,17 @@ and both the node walk and the firmlink rule see it; elsewhere it does not
 exist and the firmlink rule alone refuses it.
 """
 import errno
+import io
 import json
 import os
 import subprocess
 import sys
 
 import pytest
+import yaml
 
-from workspace import overlap
-from test_gen import WS, contents, generate, run
+from workspace import gen, overlap, scan
+from test_gen import WS, contents, generate, plan_hash, registry, run
 from test_scan import REPO_ROOT
 
 DATA_VOLUME = "/System/Volumes/Data"
@@ -298,6 +300,22 @@ def test_the_firmlink_spelling_of_missing_folders_is_refused(tmp_path, monkeypat
     assert overlap.identity(DATA_VOLUME + home + "/x") == overlap.identity(home + "/x")
 
 
+def test_a_dangling_link_to_the_firmlink_spelling_of_a_missing_folder_is_refused(tmp_path,
+                                                                                 monkeypatch):
+    # ~/rooms exists, ~/rooms/gone does not, and the link names the Data-volume
+    # spelling of ~/rooms/gone/x: it resolves to that text on every platform, and
+    # only the rule that drops a leading /System/Volumes/Data sees it.
+    ws = home_ws(tmp_path, monkeypatch)
+    home = REAL_REALPATH(str(ws.base))
+    (ws.base / "rooms").mkdir()
+    link = ws.base / "src" / "room-link"
+    link.symlink_to(DATA_VOLUME + home + "/rooms/gone/x")
+    assert not os.path.exists(link)
+    set_ingest(ws, "~/src/room-link")
+    out = gen_refused(ws)
+    assert line("ingest", str(link), "~/rooms/**") in out, out
+
+
 # --------------------------------------------------------------------------
 # Bar 4: case and Unicode variants (`fold`), on folders that do not exist
 # --------------------------------------------------------------------------
@@ -367,6 +385,102 @@ def test_every_form_of_an_excluded_entry_is_judged_as_its_folder(tmp_path, monke
     set_ingest(ws, "~/src/room-link")
     out = gen_refused(ws)
     assert line("ingest", str(ws.base / "src" / "room-link"), entry) in out, out
+
+
+# Each holds `*`, `?` or `[` once one trailing `/**` or `/*` and every trailing
+# `/` are dropped: a pattern, not a folder.
+GLOB_ENTRIES = ["~/r?oms/**", "~/r[o]oms/**", "~/rooms/**/", "~/rooms/*/", "~/src/priv-*",
+                "~/[priv]"]
+GLOB_LITERAL = {"~/r?oms/**": "r?oms", "~/r[o]oms/**": "r[o]oms", "~/rooms/**/": "rooms/**",
+                "~/rooms/*/": "rooms/*", "~/src/priv-*": "src/priv-*", "~/[priv]": "[priv]"}
+
+
+def glob_line(entry):
+    return "UNKNOWN  " + scan.EXCLUDED_GLOB % entry
+
+
+@pytest.mark.parametrize("on_disk", [False, True], ids=["absent", "present"])
+@pytest.mark.parametrize("entry", GLOB_ENTRIES)
+def test_an_excluded_entry_holding_a_glob_character_is_unknown_for_gen(tmp_path, monkeypatch,
+                                                                         entry, on_disk):
+    # The symlink into ~/rooms/private is what a pattern read as literal text
+    # would let through; the entry is refused before any folder is judged.
+    ws = home_ws(tmp_path, monkeypatch, excluded=[{"path": entry, "reason": "r"}])
+    if on_disk:
+        (ws.base / GLOB_LITERAL[entry]).mkdir(parents=True, exist_ok=True)
+    (ws.base / "rooms" / "private").mkdir(parents=True, exist_ok=True)
+    (ws.base / "src" / "room-link").symlink_to(ws.base / "rooms" / "private")
+    set_ingest(ws, "~/src/room-link")
+    out = gen_unknown(ws)
+    assert glob_line(entry) in out.splitlines(), out
+    assert "REFUSED" not in out, out
+
+
+@pytest.mark.parametrize("entry", GLOB_ENTRIES)
+def test_an_excluded_entry_holding_a_glob_character_is_unknown_for_check(tmp_path, entry):
+    home, ws = check_ws(tmp_path)
+    (home / "src" / "alpha").mkdir()
+    registry_file = ws / "registry.yaml"
+    text = registry_file.read_text(encoding="utf-8")
+    changed = text.replace("  - path: ~/scratch\n", '  - path: "%s"\n' % entry)
+    assert changed != text
+    registry_file.write_text(changed, encoding="utf-8")
+    code, out = run_check(home, ws)
+    assert code == 2, out
+    assert glob_line(entry) in out.splitlines(), out
+    assert "PASS" not in out and "GAP" not in out, out
+
+
+def test_the_glob_judgement_reads_the_entry_text_only(monkeypatch):
+    def no_call(*args, **kwargs):
+        raise AssertionError("a file system call during the glob judgement: %r" % (args,))
+
+    monkeypatch.setenv("HOME", "/nowhere/h[o]me")
+    with monkeypatch.context() as patch:
+        for module, name in ((os, "lstat"), (os, "stat"), (os, "listdir"), (os, "scandir"),
+                             (os.path, "realpath"), (os.path, "exists")):
+            patch.setattr(module, name, no_call)
+        refusals = []
+        for entry in GLOB_ENTRIES:
+            with pytest.raises(scan.Unverifiable) as caught:
+                scan.exclusion_pattern(entry)
+            refusals.append(str(caught.value))
+        accepted = [scan.exclusion_pattern(entry)
+                    for entry in ("~/rooms/**", "~/rooms/*", "~/rooms/", "~/rooms", "~/a]b")]
+    assert refusals == [scan.EXCLUDED_GLOB % entry for entry in GLOB_ENTRIES]
+    assert accepted == ["/nowhere/h[o]me/rooms"] * 4 + ["/nowhere/h[o]me/a]b"]
+
+
+@pytest.mark.parametrize("entry", ["~/a]b", "~/a]b/**"])
+def test_a_closing_bracket_alone_is_literal(tmp_path, monkeypatch, entry):
+    ws = home_ws(tmp_path, monkeypatch, excluded=[{"path": entry, "reason": "r"}])
+    (ws.base / "a]b" / "private").mkdir(parents=True)
+    (ws.base / "src" / "room-link").symlink_to(ws.base / "a]b" / "private")
+    set_ingest(ws, "~/src/room-link")
+    out = gen_refused(ws)
+    assert line("ingest", str(ws.base / "src" / "room-link"), entry) in out, out
+    set_ingest(ws, "~/src/ingest")
+    generate(ws)
+    code, out = run_check(ws.base, ws.path)
+    assert code == 0, out
+
+
+def test_an_entry_is_judged_before_home_expands(tmp_path, monkeypatch):
+    # HOME's own name holds `[`; the entry text `~/rooms/**` holds none, so it is
+    # accepted, and it is still judged as the folder it names.
+    base = tmp_path / "h[o]me"
+    base.mkdir()
+    ws = WS(base, monkeypatch)
+    ws.document["excluded"].append(dict(ROOMS))
+    ws.write_registry()
+    (base / "rooms" / "private").mkdir(parents=True)
+    generate(ws)
+    code, out = run_check(base, ws.path)
+    assert code == 0, out
+    (base / "src" / "room-link").symlink_to(base / "rooms" / "private")
+    set_ingest(ws, "~/src/room-link")
+    out = gen_refused(ws)
+    assert line("ingest", str(base / "src" / "room-link"), "~/rooms/**") in out, out
 
 
 # --------------------------------------------------------------------------
@@ -644,3 +758,87 @@ def test_a_project_link_to_another_spelling_of_an_excluded_folders_parent_is_ref
     ws.document["excluded"] = [{"path": "~/rooms/secret", "reason": "r"}]
     set_ingest(ws, up)
     gen_refused(ws)
+
+
+# --------------------------------------------------------------------------
+# The workspace argument resolves as the kernel resolves it (retired T5)
+# --------------------------------------------------------------------------
+
+def shaped_home(tmp_path, monkeypatch, shape):
+    """HOME as a real folder ("resolved") or a symlink to one ("linked"), holding src."""
+    real = tmp_path / "home-real"
+    real.mkdir()
+    home = real
+    if shape == "linked":
+        home = tmp_path / "home"
+        home.symlink_to(real)
+    monkeypatch.setenv("HOME", str(home))
+    (home / "src").mkdir()
+    return home
+
+
+def put_registry(folder, document):
+    (folder / "registry.yaml").write_text(yaml.safe_dump(document, sort_keys=False),
+                                          encoding="utf-8")
+
+
+def generate_at(argument):
+    """gen's plan, then its write, for WORKSPACE typed exactly as `argument`."""
+    planned = io.StringIO()
+    code = gen.main(argument, host="desk", out=planned)
+    assert code == 0, planned.getvalue()
+    written = io.StringIO()
+    code = gen.main(argument, host="desk", write=True, expect=plan_hash(planned.getvalue()),
+                    out=written)
+    assert code == 0, written.getvalue()
+
+
+@pytest.mark.parametrize("shape", ["resolved", "linked"])
+def test_a_workspace_argument_through_a_link_and_dotdot_writes_in_the_physical_folder(
+        tmp_path, monkeypatch, shape):
+    # ws-a/link -> ws-b/sub, so `ws-a/link/..`, typed from HOME, names ws-b. ws-a
+    # holds its own registry (one project fewer), editor file and map.
+    home = shaped_home(tmp_path, monkeypatch, shape)
+    (home / "ws-a").mkdir()
+    (home / "ws-b" / "sub").mkdir(parents=True)
+    (home / "ws-a" / "link").symlink_to(home / "ws-b" / "sub")
+    lexical = registry()
+    del lexical["projects"][1]
+    put_registry(home / "ws-a", lexical)
+    put_registry(home / "ws-b", registry())
+    (home / "ws-a" / "desk.code-workspace").write_bytes(
+        b'{"folders": [], "settings": {"ws-a": "own file"}}\n')
+    (home / "ws-a" / "AGENTS.md").write_bytes(b"# ws-a's own map\n")
+    before = contents(home / "ws-a")
+    monkeypatch.chdir(home)
+    generate_at(os.path.join("ws-a", "link", os.pardir))
+    assert contents(home / "ws-a") == before
+    written = json.loads((home / "ws-b" / "desk.code-workspace").read_text(encoding="utf-8"))
+    assert [folder["name"] for folder in written["folders"]] == ["shop-web", "ingest"]
+    assert (home / "ws-b" / "AGENTS.md").is_file()
+    assert os.listdir(home / "ws-b" / "sub") == []
+
+
+@pytest.mark.parametrize("shape", ["resolved", "linked"])
+def test_an_absolute_workspace_argument_through_a_link_and_dotdot_keeps_another_workspace(
+        tmp_path, monkeypatch, shape):
+    # lexical/shortcut -> actual/nested, the registry in actual, and an unrelated
+    # editor file with settings and a launch configuration in lexical.
+    home = shaped_home(tmp_path, monkeypatch, shape)
+    (home / "lexical").mkdir()
+    (home / "actual" / "nested").mkdir(parents=True)
+    (home / "lexical" / "shortcut").symlink_to(home / "actual" / "nested")
+    put_registry(home / "actual", registry())
+    unrelated = home / "lexical" / "desk.code-workspace"
+    kept = json.dumps({
+        "folders": [{"path": str(home / "other-project")}],
+        "settings": {"editor.fontSize": 17},
+        "launch": {"configurations": [{"name": "personal-debug", "type": "python"}]},
+    }).encode("utf-8")
+    unrelated.write_bytes(kept)
+    before = contents(home / "lexical")
+    generate_at(os.path.join(str(home), "lexical", "shortcut", os.pardir))
+    assert unrelated.read_bytes() == kept, "another workspace's file was overwritten"
+    assert contents(home / "lexical") == before
+    assert (home / "actual" / "desk.code-workspace").is_file()
+    assert os.listdir(home / "actual" / "nested") == []

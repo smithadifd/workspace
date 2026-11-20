@@ -113,8 +113,9 @@ The paragraph above is the promise of `scan`. `scan --edges` keeps it with two d
   and `.claude/settings.json`. `scan` reads only `registry.yaml`. `gen` reads
   `registry.yaml`, the map, `.claude/settings.json`, its manifest
   `.workspace-gen.json`, this host's `state/gen-<host>.json` and
-  `<host>.code-workspace`; it never reads a repository, and it looks up (never
-  opens) each excluded entry whose text holds a glob character.
+  `<host>.code-workspace`; it never reads a repository. To judge that no
+  project folder reaches an excluded folder (below) it looks up, and never
+  opens, each project folder and excluded entry and the folders above them.
 - `register` reads the repository at PATH the way `scan` reads a repository:
   PATH is walked from the code root one step at a time and refused, before
   anything under it is touched, when a step is excluded, outside the code root,
@@ -172,10 +173,11 @@ The paragraph above is the promise of `scan`. `scan --edges` keeps it with two d
 **What it never reads.**
 
 - Anything beneath a path the registry lists under `excluded`. An exclusion
-  written as a bare folder, as `folder/*` or as `folder/**` covers that folder
-  and everything beneath it. That is where you list agent scratch folders,
-  worktree copies, and folders that hold live personal data, such as a rooms
-  folder (`~/rooms`).
+  written as a bare folder, as `folder/`, as `folder/*` or as `folder/**`
+  covers that folder and everything beneath it. That is where you list agent
+  scratch folders, worktree copies, and folders that hold live personal data,
+  such as a rooms folder (`~/rooms`). An exclusion names one folder or file,
+  never a pattern (see below).
 - Anything outside the code root, through a symlink or otherwise.
 - Without `--edges`, the contents of a repository: `scan` lists or opens
   nothing inside a repository apart from its `.git` marker and the git files
@@ -192,10 +194,19 @@ reaches it. And by identity: `scan` looks up each excluded entry that exists
 lands on the same folder or file, whatever it is called. So an exclusion
 written `~/Code/private` still covers `~/code/private` on a case-insensitive
 disk, and an exclusion reached through a symlinked parent still covers the
-folder it names. An excluded path is also matched by its literal text, so a
-folder whose real name holds a glob character, such as `[priv]`, is covered by
-its text and by its identity. Any other entry that a glob character other than
-the trailing `/*` or `/**` matches is matched by its text only.
+folder it names.
+
+An excluded entry names one folder or file, never a pattern. Once one trailing
+`/**` or `/*` and then any trailing `/` are dropped, an entry whose text, as
+written and before `~` expands, still holds `*`, `?` or `[` is refused, whether
+or not such a name exists on disk: `scan`, `scan --edges`, `register` and `gen`
+end with exit 2, write nothing and name the entry, and so does `check` whenever
+it judges a project folder or compares generated files (the SessionStart
+`prompt` stays silent). A `]` alone is literal. So `~/rooms/**`, `~/rooms/*`,
+`~/rooms/` and `~/rooms` all name `~/rooms`, while `~/rooms/**/`,
+`~/src/priv-*` and a folder named `[priv]` are refused. Instead, list each
+folder on its own, renaming one whose name holds such a character, or exclude
+the folder above them.
 
 **A project folder never reaches an excluded folder.** `gen` refuses, with exit
 1 and nothing written, and `check` reports as a gap, a registry in which a
@@ -210,13 +221,14 @@ compared with letter case and Unicode composition folded and with a leading
 `/System/Volumes/Data` (the macOS firmlink spelling) dropped; and by device and
 inode, of the folder and of every parent folder the system reaches from it with
 `..`. So a symlink such as `~/code/room-link` pointing into `~/rooms/private`, a
-project folder that holds an excluded folder, another letter case, a firmlink, a
-bind mount or volfs spelling of the same folder are all refused. A folder that
-does not exist on this host is not refused for that alone; it is still judged by
-its real path and by the folders above it that do exist. A folder or parent that
-cannot be looked up for any other reason (no permission, a symlink loop) is a
-could-not-verify: exit 2, nothing written. Code roots are not judged this way: an
-excluded folder inside a code root is the usual layout.
+project folder that holds an excluded folder, another letter case, a firmlink or
+volfs spelling of the same folder, and a symlink to either, are all refused;
+those are the spellings the tests cover, and a bind mount is not claimed. A
+folder that does not exist on this host is not refused for that alone; it is
+still judged by its real path and by the folders above it that do exist. A
+folder or parent that cannot be looked up for any other reason (no permission, a
+symlink loop) is a could-not-verify: exit 2, nothing written. Code roots are not
+judged this way: an excluded folder inside a code root is the usual layout.
 `check` skips a project path that is null on a host, and a placeholder path
 written as `<...>` (the template's), while `gen` refuses both with exit 2; any
 other path that is neither absolute nor starts with `~` is a could-not-verify
@@ -286,11 +298,14 @@ These are not covered:
   opened without following a symlink and must be the file the walk found. With
   `--edges`, and in `register`, this holds inside repositories too; a folder is
   listed only when it is still the folder the walk found.
-- An entry matched only by a glob other than a trailing `/*` or `/**`, not by
-  the exclusion's literal text, is matched by its text only, so another letter
-  case of it is not recognised. This holds inside repositories too, for
-  `scan --edges` and `register`: an exclusion such as `~/src/app/priv-*` prunes
-  `priv-notes` by its text, not by its identity.
+- An excluded entry names one folder or file, so a family of folders is listed
+  one by one: a pattern such as `~/src/app/priv-*` is refused with exit 2, and a
+  folder created later under such a name is not covered until it is listed. A
+  folder whose own name holds `*`, `?` or `[` cannot be listed by that name:
+  rename it, or exclude the folder above it.
+- A symlink inside the tree of a folder `gen` writes to the `.code-workspace`
+  file is not judged: the excluded-overlap rule judges each project folder and
+  the folders above it, never what lies beneath it.
 - Edge detectors are name heuristics: a candidate can be wrong, and a real
   dependency can be missed.
 - An approved edge whose evidence is prose, rather than `path:LINE`, is never
@@ -301,12 +316,11 @@ These are not covered:
   runs; a symlink changed afterwards is not seen. A hard link to a file inside
   an excluded folder has no parent folder to compare, so it is not recognised.
 - `gen`'s check that the map imports nothing inside a registered repository
-  compares paths by their text, so an `@` import through a symlinked folder into
-  a registered repository is not recognised.
-- An excluded entry whose real name holds a `[` glob class (such as `[priv]`)
-  cannot be denied by a Claude Code rule that matches its literal name; `gen`
-  refuses such a workspace with exit 2 and names the entry, and an entry
-  created with such a name after `gen` ran is not denied.
+  compares paths by their text. A relative `@` import is resolved against the
+  workspace folder both as you typed it and as the system resolves it, but an
+  import through a symlink inside its own path, a project path or home folder
+  reached through a symlink, and another letter case or Unicode form of a
+  project path are not recognised.
 - Each excluded entry that exists is looked up, including entries outside the
   code root, to learn its identity. It is never opened.
 - A rewrite of a file that keeps its inode and size is caught only by its
