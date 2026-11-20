@@ -60,7 +60,6 @@ Exit codes: 0 planned or written, 1 refused, 2 could not verify.
 """
 import copy
 import difflib
-import fnmatch
 import hashlib
 import json
 import os
@@ -374,29 +373,6 @@ def overlap_gate(document):
         raise Refusal(*reasons)
 
 
-def literal_gate(excluded):
-    """An excluded entry whose real name holds a glob character no deny rule can match literally.
-
-    `scan` excludes such an entry by its literal text, but a deny rule reads
-    `[`, `*` and `?` as a pattern. When the literal entry exists and the
-    pattern does not match its own text, no rule gen can write (and `check`
-    accepts) denies it, so gen cannot verify the settings it would write.
-    """
-    for text in excluded:
-        literal = scan.exclusion_pattern(text)
-        if not any(character in literal for character in GLOB_CHARACTERS):
-            continue
-        try:
-            os.lstat(literal)
-        except OSError:
-            continue
-        if not fnmatch.fnmatchcase(literal, literal):
-            raise scan.Unverifiable(
-                "excluded path `%s` names the entry %s, whose real name holds a glob character "
-                "that a deny rule reads as a pattern; no deny rule gen can write matches it, so "
-                "it is not denied (rename it, or exclude the folder above it)" % (text, literal))
-
-
 # --------------------------------------------------------------------------
 # Keep blocks (G7)
 # --------------------------------------------------------------------------
@@ -570,8 +546,15 @@ def import_tokens(text):
 
 
 def import_gate(text, document, workspace):
-    """Refuse an `@` import that resolves inside a registered project's path on any host."""
-    base = os.path.abspath(workspace)
+    """Refuse an `@` import that resolves inside a registered project's path on any host.
+
+    A relative token is judged against the workspace folder twice: as typed
+    (`os.path.abspath`, which drops a `link/..` by its text) and as the kernel
+    resolves it (`os.path.realpath`, the folder gen reads and writes). The
+    token is refused when either lands inside a project path, with one line
+    per token. A `~` token is expanded and judged once.
+    """
+    bases = (os.path.abspath(workspace), os.path.realpath(workspace))
     projects = []
     for project in document.get("projects") or []:
         for path in (project.get("paths") or {}).values():
@@ -581,16 +564,16 @@ def import_gate(text, document, workspace):
     for token in import_tokens(text):
         try:
             if token.startswith("~"):
-                resolved = scan.expand_path(token, "import")
+                candidates = [scan.expand_path(token, "import")]
             else:
-                resolved = os.path.normpath(os.path.join(base, token))
+                candidates = [os.path.normpath(os.path.join(base, token)) for base in bases]
         except scan.Unverifiable:
             continue
-        for path, name in projects:
-            if scan.within(resolved, path):
-                reasons.append("the map imports @%s, which resolves inside project `%s`; the map "
-                               "must stay lazy" % (token, name))
-                break
+        inside = [name for resolved in candidates for path, name in projects
+                  if scan.within(resolved, path)]
+        if inside:
+            reasons.append("the map imports @%s, which resolves inside project `%s`; the map "
+                           "must stay lazy" % (token, inside[0]))
     if reasons:
         raise Refusal(*reasons)
 
@@ -1035,7 +1018,6 @@ def make_plan(workspace, host_flag, adopt, shared_only=False):
     exclusions = [scan.exclusion_pattern(path) for path in excluded]
     path_gate(document, exclusions)
     overlap_gate(document)
-    literal_gate(excluded)
     output_folder_gate(workspace, (".claude",) if shared_only else OUTPUT_FOLDERS)
 
     manifest_snapshot, manifest = read_manifest(workspace, MANIFEST_NAME)

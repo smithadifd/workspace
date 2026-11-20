@@ -1615,28 +1615,31 @@ def test_registered_path_through_a_symlink_is_unknown(tmp_path, monkeypatch):
                    % (link, link))
 
 
-def test_git_dir_excluded_by_a_glob_is_refused_by_its_text(tmp_path, monkeypatch):
-    # A glob names no single entry, so its text is the only guard.
+def test_git_dir_excluded_by_a_glob_is_unknown_before_any_file_call(tmp_path, monkeypatch):
+    # A glob names no single entry: the registry is refused before the walk.
     tree = Tree(tmp_path)
-    tree.registry["excluded"] = [{"path": str(tree.root / "secr?t"), "reason": "fixture"}]
+    entry = str(tree.root / "secr?t")
+    tree.registry["excluded"] = [{"path": entry, "reason": "fixture"}]
     tree.write_registry()
     meta = secret_worktree_meta(tree)
     odd = worktree_file(tree, meta)
     trace = Trace()
     code, out = trace.run(monkeypatch, tree)
-    assert_unknown(code, out, "worktree %s keeps its git dir at %s, which is excluded; not read"
-                   % (odd, meta))
+    assert_unknown(code, out, scan.EXCLUDED_GLOB % entry)
     assert trace.beneath(tree.root / "secret") == [], trace.beneath(tree.root / "secret")
+    assert trace.under(odd) == [], trace.under(odd)
+    assert trace.git_calls == [], trace.git_calls
 
 
 def test_git_marker_excluded_by_a_glob_is_unknown_and_not_touched(tmp_path, monkeypatch):
-    # The glob names no entry on disk, so the marker's text is its only guard.
+    # A glob names no single entry: the registry is refused before the walk.
     tree = Tree(tmp_path)
     marker = tree.root / "alpha-wt" / ".git"
-    exclude(tree, tree.root / "alpha-w*" / ".git")
+    entry = str(tree.root / "alpha-w*" / ".git")
+    exclude(tree, entry)
     trace = Trace()
     code, out = trace.run(monkeypatch, tree)
-    assert_unknown(code, out, "git marker %s, which is excluded; not read" % marker)
+    assert_unknown(code, out, scan.EXCLUDED_GLOB % entry)
     assert trace.under(marker) == [], trace.under(marker)
     assert trace.opened(marker) == [], trace.opened(marker)
 
@@ -1653,30 +1656,29 @@ def glob_named_repo(tree, name, written):
     return folder
 
 
-def assert_glob_named_skipped(folder, code, out, trace):
-    assert code == 0, out
-    assert "SKIP   %s: excluded path, not read" % folder in out.splitlines(), out
+def assert_glob_named_refused(folder, entry, code, out, trace):
+    """Exit 2 naming the entry as written; nothing at or beneath the folder is touched."""
+    assert_unknown(code, out, scan.EXCLUDED_GLOB % entry)
     assert "sentinel" not in out, out
-    assert trace.beneath(folder) == [], "scan touched beneath the excluded path: %r" % trace.beneath(folder)
-    assert trace.opened(folder) == [], trace.opened(folder)
+    calls = [call for call in trace.calls if reaches(call[1], str(folder), itself=True)]
+    assert calls == [], "scan touched the excluded folder: %r" % calls
     assert trace.git_under(folder) == [], trace.git_under(folder)
 
 
 @GLOB_NAMES
-def test_excluded_name_holding_a_glob_character_is_matched_by_its_text(tmp_path, monkeypatch, name):
+def test_excluded_name_holding_a_glob_character_is_unknown_before_any_file_call(
+        tmp_path, monkeypatch, name):
+    # A real folder whose name holds a glob character cannot be excluded by that
+    # name: the entry is refused by its text, whatever exists on disk.
     tree = Tree(tmp_path)
     folder = glob_named_repo(tree, name, name)
     trace = Trace()
     code, out = trace.run(monkeypatch, tree)
-    assert_glob_named_skipped(folder, code, out, trace)
-    # Its text refuses it before any file call: the one call that reaches it
-    # is the lstat that learns its identity, never a look by the listing.
-    calls = [call for call in trace.calls if reaches(call[1], str(folder), itself=True)]
-    assert calls == [("lstat", str(folder))], calls
+    assert_glob_named_refused(folder, str(tree.root / name), code, out, trace)
 
 
 @GLOB_NAMES
-def test_excluded_name_holding_a_glob_character_in_another_case_is_matched_by_identity(
+def test_excluded_name_holding_a_glob_character_in_another_case_is_unknown(
         tmp_path, monkeypatch, name):
     # The registry says the name in capitals; the folder on disk is lower case.
     tree = Tree(tmp_path)
@@ -1684,7 +1686,7 @@ def test_excluded_name_holding_a_glob_character_in_another_case_is_matched_by_id
     fold_case(monkeypatch, tree.root, name)
     trace = Trace()
     code, out = trace.run(monkeypatch, tree)
-    assert_glob_named_skipped(folder, code, out, trace)
+    assert_glob_named_refused(folder, str(tree.root / name.upper()), code, out, trace)
 
 
 # --------------------------------------------------------------------------
