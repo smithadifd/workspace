@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.4](https://github.com/smithadifd/workspace/compare/v0.1.3...v0.1.4) (2026-11-20)
+
+
+### Documentation
+
+* **security:** say scan refuses config includes instead of following them ([#14](https://github.com/smithadifd/workspace/issues/14)) ([c78052f](https://github.com/smithadifd/workspace/commit/c78052f0d9d2b0b81cec53771eb1ea21207ae004))
+
 ## [0.1.3](https://github.com/smithadifd/workspace/compare/v0.1.2...v0.1.3) (2026-11-19)
 
 
