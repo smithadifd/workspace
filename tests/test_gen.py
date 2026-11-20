@@ -599,6 +599,68 @@ def test_imports_into_a_registered_project_are_refused(tmp_path, monkeypatch, wh
     assert contents(ws.path) == before
 
 
+IMPORT_LINE = "which resolves inside project `"
+
+
+def import_refused(tmp_path, argument, token, project_name):
+    """gen's plan for WORKSPACE typed as `argument`: exit 1, one line for `token`, nothing written."""
+    before = contents(tmp_path)
+    buffer = io.StringIO()
+    code = gen.main(argument, host=HOST, out=buffer)
+    out = buffer.getvalue()
+    refused(code, out, "the map imports @%s, which resolves inside project `%s`"
+            % (token, project_name))
+    assert out.count(IMPORT_LINE) == 1, out
+    assert contents(tmp_path) == before
+
+
+def test_an_import_inside_a_project_only_from_the_physical_folder_is_refused(tmp_path,
+                                                                             monkeypatch):
+    # WORKSPACE is typed `ws-a/link/..` with ws-a/link -> src/ws-b/sub: the kernel
+    # opens src/ws-b, where the map is, so `@../shop-web` lands in the project;
+    # from the typed folder, ws-a, it would land in ~/shop-web, which is no project.
+    monkeypatch.setenv("HOME", str(tmp_path))
+    document = registry()
+    token = "../shop-web/AGENTS.md"
+    document["projects"][1]["one_liner"] = "see @" + token
+    ws_b = tmp_path / "src" / "ws-b"
+    (ws_b / "sub").mkdir(parents=True)
+    (ws_b / "registry.yaml").write_text(yaml.safe_dump(document, sort_keys=False),
+                                        encoding="utf-8")
+    (tmp_path / "ws-a").mkdir()
+    (tmp_path / "ws-a" / "link").symlink_to(ws_b / "sub")
+    monkeypatch.chdir(tmp_path)
+    import_refused(tmp_path, os.path.join("ws-a", "link", os.pardir), token, "shop-web")
+
+
+def test_an_import_inside_a_project_only_from_the_typed_folder_is_refused(tmp_path,
+                                                                          monkeypatch):
+    # WORKSPACE is typed as a plain symlink alias two folders down: from the alias
+    # `@../../src/shop-web` lands in the project; from the real folder it would
+    # land above HOME.
+    ws = WS(tmp_path, monkeypatch)
+    token = "../../src/shop-web/AGENTS.md"
+    ws.document["projects"][1]["one_liner"] = "see @" + token
+    ws.write_registry()
+    (tmp_path / "links").mkdir()
+    alias = tmp_path / "links" / "alias"
+    os.symlink(ws.path, alias)
+    import_refused(tmp_path, str(alias), token, "shop-web")
+
+
+def test_an_import_both_folders_place_in_a_project_is_refused_once(tmp_path, monkeypatch):
+    # From the alias src/alias, `@../ingest` lands in ingest (~/src/ingest); from
+    # the real folder ~/ws it lands in legacy (~/ingest). One line for the token.
+    ws = WS(tmp_path, monkeypatch)
+    token = "../ingest/notes.md"
+    ws.document["projects"][1]["one_liner"] = "see @" + token
+    ws.document["projects"][2]["paths"] = {HOST: "~/ingest"}
+    ws.write_registry()
+    alias = tmp_path / "src" / "alias"
+    os.symlink(ws.path, alias)
+    import_refused(tmp_path, str(alias), token, "ingest")
+
+
 def fill_to(ws, size):
     """Pad the top keep block so the rendered map is exactly `size` bytes."""
     ws.write("AGENTS.md", keep_text(top="x\n"))
@@ -1133,16 +1195,23 @@ def test_each_literal_form_gets_the_check_accepted_pair(tmp_path, monkeypatch):
 
 
 def test_a_glob_base_gets_both_pairs(tmp_path, monkeypatch):
-    paths = ["~/x/*", "/abs/y/*", "~/z/priv-*"]
+    paths = ["~/x/*", "/abs/y/*"]
     deny = deny_for(tmp_path, monkeypatch, paths)
     assert deny == ["Read(~/x/*)", "Edit(~/x/*)", "Read(~/x/*/**)", "Edit(~/x/*/**)",
                     "Read(//abs/y/*)", "Edit(//abs/y/*)", "Read(//abs/y/*/**)",
-                    "Edit(//abs/y/*/**)", "Read(~/z/priv-*)", "Edit(~/z/priv-*)",
-                    "Read(~/z/priv-*/**)", "Edit(~/z/priv-*/**)"], deny
+                    "Edit(//abs/y/*/**)"], deny
     for path in paths:
         forms = {"%s(%s)" % (verb, form) for form in check.permission_forms(path)
                  for verb in ("Read", "Edit")}
         assert set(gen.deny_rules(path)) <= forms
+
+
+def test_a_pattern_exclusion_gets_no_deny_rule_and_is_refused(tmp_path, monkeypatch):
+    # `~/z/priv-*` named a family of folders; an excluded entry now names one.
+    ws = WS(tmp_path, monkeypatch)
+    ws.document["excluded"] = [{"path": "~/z/priv-*", "reason": "r"}]
+    ws.write_registry()
+    glob_refused(ws, "~/z/priv-*")
 
 
 def test_existing_covering_pair_is_not_duplicated(tmp_path, monkeypatch):
@@ -1257,34 +1326,51 @@ def test_map_that_cannot_be_opened_is_unknown(tmp_path, monkeypatch):
     assert "UNKNOWN  could not read AGENTS.md: " in out, out
 
 
+def glob_refused(ws, entry):
+    """gen with `entry` excluded: exit 2 naming the entry as written, nothing written."""
+    before = contents(ws.base)
+    for expect in (None, "0" * 64):
+        code, out = run(ws, expect=expect)
+        assert code == 2, out
+        assert "UNKNOWN  " + scan.EXCLUDED_GLOB % entry in out, out
+    assert contents(ws.base) == before
+
+
 @pytest.mark.parametrize("name", ["[priv]", "p[ri]v"])
 def test_excluded_real_name_with_a_glob_class_is_refused(tmp_path, monkeypatch, name):
     ws = WS(tmp_path, monkeypatch)
     (tmp_path / name).mkdir()
     ws.document["excluded"].append({"path": "~/%s" % name, "reason": "r"})
     ws.write_registry()
-    before = contents(ws.path)
-    code, out = run(ws)
-    assert code == 2, out
-    assert "UNKNOWN  excluded path `~/%s` names the entry %s" % (name, tmp_path / name) in out, out
-    assert contents(ws.path) == before
+    glob_refused(ws, "~/%s" % name)
 
 
-def test_excluded_glob_class_with_no_real_entry_is_written(tmp_path, monkeypatch):
+def test_excluded_glob_class_with_no_real_entry_is_refused(tmp_path, monkeypatch):
     ws = WS(tmp_path, monkeypatch)
     ws.document["excluded"].append({"path": "~/[priv]", "reason": "r"})
     ws.write_registry()
-    generate(ws)
-    check_passes(ws)
+    assert not (tmp_path / "[priv]").exists()
+    glob_refused(ws, "~/[priv]")
 
 
-def test_excluded_star_name_that_exists_is_matched_by_its_own_rule(tmp_path, monkeypatch):
+def test_excluded_star_name_that_exists_is_refused(tmp_path, monkeypatch):
     ws = WS(tmp_path, monkeypatch)
     (tmp_path / "pr*v").mkdir()
     ws.document["excluded"].append({"path": "~/pr*v", "reason": "r"})
     ws.write_registry()
-    generate(ws)
-    assert "Read(~/pr*v)" in ws.settings()["permissions"]["deny"]
+    glob_refused(ws, "~/pr*v")
+
+
+def test_a_relative_excluded_entry_is_unknown_and_nothing_is_written(tmp_path, monkeypatch):
+    ws = WS(tmp_path, monkeypatch)
+    ws.document["excluded"].append({"path": "private", "reason": "r"})
+    ws.write_registry()
+    before = contents(tmp_path)
+    for expect in (None, "0" * 64):
+        code, out = run(ws, expect=expect)
+        assert code == 2, out
+        assert "UNKNOWN  excluded path `private` is not an absolute path" in out, out
+    assert contents(tmp_path) == before
 
 
 # --------------------------------------------------------------------------
@@ -1418,8 +1504,13 @@ def test_readme_keeps_the_scan_promise_and_scopes_it():
         assert gone not in readme, gone
     assert "Without `--edges`, the contents of a repository" in readme
     assert "`register` do read source files inside repositories" in readme
-    known_limits = readme_section("Known limits")
-    assert "`priv-notes` by its text, not by its identity" in known_limits
+    known_limits = " ".join(readme_section("Known limits").split())
+    assert "so a family of folders is listed one by one" in known_limits
+    assert "`~/src/app/priv-*` is refused with exit 2" in known_limits
+    assert "A symlink inside the tree of a folder `gen` writes" in known_limits
+    assert "by its text, not by its identity" not in known_limits
+    assert "bind mount" not in (REPO_ROOT / "README.md").read_text(encoding="utf-8").replace(
+        "a bind mount is not claimed", "")
 
 
 def test_template_registry_follows_the_grammar():
@@ -1664,7 +1755,7 @@ FILE_CALLS = {
     "gen.py": {
         "os.open": {"open_folder", "make_folder", "write_temp"},
         "os.fdopen": {"write_temp"},
-        "os.lstat": {"output_folder_gate", "literal_gate"},
+        "os.lstat": {"output_folder_gate"},
         "os.listdir": {"remove_leftover_temps"},
     },
     "register.py": {},

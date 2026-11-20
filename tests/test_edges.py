@@ -410,16 +410,21 @@ def test_symlinked_alias_of_an_excluded_folder_is_not_followed(tmp_path, monkeyp
     assert "could not read" not in out, out
 
 
-def test_glob_excluded_entry_in_a_repo_is_pruned_by_its_text(tmp_path, monkeypatch):
-    # A glob in the middle of a name is matched by its text, as on plain scan.
+def test_glob_excluded_entry_in_a_repo_is_unknown_before_any_file_call(tmp_path, monkeypatch):
+    # A glob in the middle of a name is a pattern, not an excluded path: the
+    # registry is refused, as on plain scan, before any repository is walked.
     tree = EdgeTree(tmp_path)
     private = tree.app / "ed" / "priv-notes"
     tree.put("ed/priv-notes/run.sh", "source ~/src/beta/lib.sh\n")
-    tree.exclude(str(tree.app / "ed" / "priv-*"))
+    entry = str(tree.app / "ed" / "priv-*")
+    tree.exclude(entry)
     trace, (code, out) = traced(monkeypatch, lambda: run_edges(tree))
+    assert code == 2, out
+    assert "UNKNOWN  " + scan.EXCLUDED_GLOB % entry in out.splitlines(), out
     assert candidates(out) == [], out
+    assert "edges:" not in out, out
     assert trace.under(private) == [], trace.under(private)
-    assert EDGE_PRUNED % (0, 1) in out.splitlines(), out
+    assert trace.under(tree.app) == [], trace.under(tree.app)
 
 
 @pytest.mark.parametrize("swap", ["symlink", "folder"])

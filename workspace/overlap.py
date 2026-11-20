@@ -14,8 +14,10 @@ and normalised. The editor file `gen` writes lists exactly that folder, so a
 `subpath` such as `../../rooms/x` is judged as the folder it reaches.
 
 The excluded folder. `scan.exclusion_pattern`: the entry with one trailing
-`/**` or `/*` and any trailing `/` dropped, `~` expanded. An entry whose text
-holds another glob character is judged as its literal text only.
+`/**` or `/*` and any trailing `/` dropped, `~` expanded. An entry that still
+holds `*`, `?` or `[` after that names a pattern, not a folder, and is a
+could-not-verify (`scan.Unverifiable`), so every entry the rule judges is one
+literal path.
 
 Identity, two ways, each in both directions:
 
@@ -34,9 +36,9 @@ Identity, two ways, each in both directions:
   until the node repeats at the root; a path that is not a folder has only
   node(s). nodes(x) gathers walk(s) for each step s of chain's lexical steps
   that exists. P overlaps E when node(E) is in nodes(P), or node(P) is in
-  nodes(E). So a spelling realpath does not unify (a firmlink, a bind mount,
-  a volfs path, a symlink to one of these) is still caught, and so is every
-  folder above it.
+  nodes(E). So a spelling realpath does not unify (a firmlink, a volfs
+  path, a symlink to either) is still caught, and so is every folder above
+  it. Those are the spellings the tests cover; a bind mount is not claimed.
 
 Fail closed. A step that does not exist (ENOENT, ENOTDIR) has no node, and
 only the name clauses apply to it: a project folder that does not exist on
@@ -181,7 +183,8 @@ def excluded_entries(document):
     as `<excluded path 1>` in the shipped template) names no folder on disk,
     so it has no identity to compare: `gen` refuses it with exit 2 before this
     rule runs (`scan.exclusion_pattern`), and `check` judges it by its text
-    only, as before. A `~` that cannot be expanded is a could-not-verify.
+    only, as before. A `~` that cannot be expanded is a could-not-verify, and
+    so is an entry that holds a glob character (`scan.exclusion_pattern`).
     """
     from workspace.check import exclusion_path
 
